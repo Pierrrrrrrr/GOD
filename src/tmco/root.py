@@ -157,7 +157,10 @@ class WindowsRootSecretStore(RootSecretStore):
             protected = self.protector.protect(secret)
             if protected == secret:
                 raise AuthorizationError("OS protector returned plaintext root material")
-            descriptor = os.open(self.path, os.O_WRONLY | os.O_CREAT | os.O_EXCL)
+            # O_BINARY is required on Windows so the opaque DPAPI blob is never
+            # altered by CRT text-mode newline translation.
+            flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_BINARY", 0)
+            descriptor = os.open(self.path, flags)
             try:
                 os.write(descriptor, protected)
                 os.fsync(descriptor)

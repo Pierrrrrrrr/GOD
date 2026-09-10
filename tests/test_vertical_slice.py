@@ -178,6 +178,7 @@ def test_windows_store_persists_only_protected_material_and_restarts(tmp_path: P
     persisted = store.path.read_bytes()
     assert protector.plaintext is not None
     assert persisted != protector.plaintext
+    assert store.open_guard(existing_organism=True).fingerprint == organism.root.key_fingerprint
     assert protector.plaintext not in (tmp_path / "checkpoint.json").read_bytes()
     assert protector.plaintext not in (tmp_path / "events.jsonl").read_bytes()
     restarted = TMCOSystem(tmp_path, DeterministicCognitionFixture(), root_secret_store=store)
