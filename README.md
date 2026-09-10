@@ -5,9 +5,10 @@ Saphira colonies, persistent digital-neuron graphs, sparse workspace exchange,
 root authorization, typed goal execution, layered memory, explicit body/model buses,
 candidate-only architecture evolution, crash-safe replay, idempotent action execution,
 and checkpoint recovery. Production execution requires explicit executor and
-observation-provider implementations.
+observation-provider implementations. Root signing material is stored separately:
+owner-only mode `0600` on POSIX and DPAPI current-user protection on Windows.
 
-Requires Python 3.12+.
+Requires Python 3.11+.
 
 ```bash
 python -m pytest
