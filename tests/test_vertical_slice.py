@@ -1,4 +1,5 @@
 import asyncio
+import os
 from pathlib import Path
 
 import pytest
@@ -138,19 +139,35 @@ def test_production_root_key_is_random_and_locally_protected(tmp_path: Path) -> 
     first = tmp_path / "first"
     second = tmp_path / "second"
     organism = TMCOSystem(first, DeterministicCognitionFixture())
-    TMCOSystem(second, DeterministicCognitionFixture())
+    other = TMCOSystem(second, DeterministicCognitionFixture())
     organism.checkpoint()
-    key = (first / "root.key").read_bytes()
-    assert key != (second / "root.key").read_bytes()
-    assert len(key) == 32
-    assert (first / "root.key").stat().st_mode & 0o777 == 0o600
-    assert key not in (first / "checkpoint.json").read_bytes()
-    assert key not in (first / "events.jsonl").read_bytes()
+    material = (first / "root.key").read_bytes()
+    assert organism.root.key_fingerprint != other.root.key_fingerprint
+    assert material != (second / "root.key").read_bytes()
+    if os.name == "nt":
+        # A DPAPI blob is not the 32-byte plaintext secret.
+        assert len(material) > 32
+        assert material != bytes.fromhex(organism.root.key_fingerprint)
+    else:
+        assert len(material) == 32
+        assert (first / "root.key").stat().st_mode & 0o777 == 0o600
+    assert material not in (first / "checkpoint.json").read_bytes()
+    assert material not in (first / "events.jsonl").read_bytes()
+
+
+def test_production_root_secret_survives_restart(tmp_path: Path) -> None:
+    organism = TMCOSystem(tmp_path, DeterministicCognitionFixture())
+    fingerprint = organism.root.key_fingerprint
+    organism.checkpoint()
+
+    restored = TMCOSystem(tmp_path, DeterministicCognitionFixture())
+    assert restored.root.key_fingerprint == fingerprint
+    assert restored.root.verify_audit()
 
 
 def test_copied_checkpoint_cannot_rekey_or_self_grant(tmp_path: Path) -> None:
     source, copied = tmp_path / "source", tmp_path / "copied"
-    organism = system(source)
+    organism = TMCOSystem(source, DeterministicCognitionFixture())
     organism.checkpoint()
     copied.mkdir()
     (copied / "checkpoint.json").write_bytes((source / "checkpoint.json").read_bytes())

@@ -5,9 +5,12 @@ Saphira-A and Saphira-B. Each owns its neurons, synapses, lineage, local memorie
 and assemblies. Cross-colony edges are invalid. Only explicitly salient, bounded
 items enter the shared Global Workspace.
 
-`RootKernel` is the signed authorization boundary. A random key lives in a mode-0600
-file separate from checkpoint/event state; checkpoints contain only its fingerprint
-and reference. The HMAC-chained audit detects mutation, and restored permissions are
+`RootKernel` is the signed authorization boundary. `RootSecretStore` keeps its random
+32-byte secret separate from checkpoint/event state: a mode-0600 file on POSIX and a
+DPAPI current-user protected blob on Windows. Only `RootGuard` temporarily holds the
+plaintext and it exposes fingerprint, sign, and verify operations; checkpoints contain
+only the fingerprint and reference. The HMAC-chained audit detects mutation, and
+restored permissions are
 derived from signed grants rather than trusted checkpoint claims. Cognition cannot
 grant permission or target root policy through evolution. `Colony` is the
 morphogenetic runtime: lightweight persistent cells

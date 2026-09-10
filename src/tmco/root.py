@@ -4,6 +4,7 @@ import hashlib
 import hmac
 import json
 import os
+from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -13,10 +14,126 @@ class AuthorizationError(PermissionError):
     pass
 
 
+class RootGuard:
+    """The only object allowed to hold the plaintext root secret."""
+
+    __slots__ = ("__secret",)
+
+    def __init__(self, secret: bytes):
+        self.__secret = secret
+
+    @property
+    def fingerprint(self) -> str:
+        return hashlib.sha256(self.__secret).hexdigest()
+
+    def sign(self, payload: bytes) -> str:
+        return hmac.new(self.__secret, payload, hashlib.sha256).hexdigest()
+
+    def verify(self, payload: bytes, signature: str) -> bool:
+        return hmac.compare_digest(self.sign(payload), signature)
+
+
+class RootSecretStore(ABC):
+    """Platform storage boundary for persistent root signing material."""
+
+    def __init__(self, directory: Path):
+        self.path = directory / "root.key"
+
+    @abstractmethod
+    def load_or_create(self, *, existing_organism: bool) -> RootGuard:
+        """Load a protected secret or create one for a new organism."""
+
+    def _unavailable(self, existing_organism: bool) -> None:
+        if existing_organism:
+            raise AuthorizationError("root key is unavailable; refusing to re-key existing organism")
+
+
+class PosixRootSecretStore(RootSecretStore):
+    def load_or_create(self, *, existing_organism: bool) -> RootGuard:
+        if self.path.exists():
+            os.chmod(self.path, 0o600)
+            secret = self.path.read_bytes()
+            if len(secret) != 32:
+                raise AuthorizationError("stored root key is invalid")
+            return RootGuard(secret)
+        self._unavailable(existing_organism)
+        secret = os.urandom(32)
+        descriptor = os.open(self.path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        try:
+            os.write(descriptor, secret)
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
+        return RootGuard(secret)
+
+
+class WindowsRootSecretStore(RootSecretStore):
+    """DPAPI current-user protected root-secret storage."""
+
+    def load_or_create(self, *, existing_organism: bool) -> RootGuard:
+        if self.path.exists():
+            try:
+                secret = self._unprotect(self.path.read_bytes())
+            except OSError as error:
+                raise AuthorizationError("root key cannot be unprotected by this user") from error
+            if len(secret) != 32:
+                raise AuthorizationError("stored root key is invalid")
+            return RootGuard(secret)
+        self._unavailable(existing_organism)
+        secret = os.urandom(32)
+        protected = self._protect(secret)
+        descriptor = os.open(self.path, os.O_WRONLY | os.O_CREAT | os.O_EXCL)
+        try:
+            os.write(descriptor, protected)
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
+        return RootGuard(secret)
+
+    @staticmethod
+    def _crypt(data: bytes, *, protect: bool) -> bytes:
+        import ctypes
+        from ctypes import wintypes
+
+        class DataBlob(ctypes.Structure):
+            _fields_ = (("size", wintypes.DWORD), ("data", ctypes.POINTER(ctypes.c_byte)))
+
+        source_buffer = ctypes.create_string_buffer(data)
+        source = DataBlob(len(data), ctypes.cast(source_buffer, ctypes.POINTER(ctypes.c_byte)))
+        destination = DataBlob()
+        crypt32 = ctypes.WinDLL("crypt32", use_last_error=True)
+        function = crypt32.CryptProtectData if protect else crypt32.CryptUnprotectData
+        function.argtypes = (
+            ctypes.POINTER(DataBlob), ctypes.c_wchar_p, ctypes.c_void_p, ctypes.c_void_p,
+            ctypes.c_void_p, wintypes.DWORD, ctypes.POINTER(DataBlob),
+        )
+        function.restype = wintypes.BOOL
+        # CRYPTPROTECT_UI_FORBIDDEN; no entropy means standard current-user scope.
+        if not function(ctypes.byref(source), None, None, None, None, 0x1,
+                        ctypes.byref(destination)):
+            raise ctypes.WinError(ctypes.get_last_error())
+        try:
+            return ctypes.string_at(destination.data, destination.size)
+        finally:
+            ctypes.windll.kernel32.LocalFree(destination.data)
+
+    @classmethod
+    def _protect(cls, data: bytes) -> bytes:
+        return cls._crypt(data, protect=True)
+
+    @classmethod
+    def _unprotect(cls, data: bytes) -> bytes:
+        return cls._crypt(data, protect=False)
+
+
+def root_secret_store(directory: Path) -> RootSecretStore:
+    return WindowsRootSecretStore(directory) if os.name == "nt" else PosixRootSecretStore(directory)
+
+
 @dataclass(slots=True)
 class RootKernel:
     owner: str
-    _secret: bytes = field(repr=False)
+    _guard: RootGuard = field(repr=False)
     key_reference: str = "root.key"
     constitution: tuple[str, ...] = (
         "root_policy_is_not_an_evolution_target",
@@ -45,47 +162,21 @@ class RootKernel:
         body = {"sequence": len(self.audit), "kind": kind, "payload": payload,
                 "previous": previous}
         encoded = json.dumps(body, sort_keys=True, separators=(",", ":")).encode()
-        body["signature"] = hmac.new(self._secret, encoded, hashlib.sha256).hexdigest()
+        body["signature"] = self._guard.sign(encoded)
         self.audit.append(body)
         return body
 
     def verify_audit(self) -> bool:
         previous = "GENESIS"
         for index, entry in enumerate(self.audit):
-            body = {k: entry[k] for k in ("sequence", "kind", "payload", "previous")}
-            expected = hmac.new(self._secret, json.dumps(
-                body, sort_keys=True, separators=(",", ":")).encode(), hashlib.sha256).hexdigest()
-            if entry["sequence"] != index or entry["previous"] != previous or not hmac.compare_digest(expected, entry["signature"]):
+            body = {key: entry[key] for key in ("sequence", "kind", "payload", "previous")}
+            encoded = json.dumps(body, sort_keys=True, separators=(",", ":")).encode()
+            if (entry["sequence"] != index or entry["previous"] != previous
+                    or not self._guard.verify(encoded, entry["signature"])):
                 return False
             previous = entry["signature"]
         return True
 
     @property
     def key_fingerprint(self) -> str:
-        return hashlib.sha256(self._secret).hexdigest()
-
-
-class RootKeyStore:
-    """Non-organism storage for root signing material."""
-
-    def __init__(self, directory: Path, injected_key: bytes | None = None):
-        self.path = directory / "root.key"
-        self.injected_key = injected_key
-
-    def load_or_create(self, *, existing_organism: bool) -> bytes:
-        if self.injected_key is not None:
-            return self.injected_key
-        if self.path.exists():
-            os.chmod(self.path, 0o600)
-            return self.path.read_bytes()
-        if existing_organism:
-            raise AuthorizationError("root key is unavailable; refusing to re-key existing organism")
-        key = os.urandom(32)
-        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
-        descriptor = os.open(self.path, flags, 0o600)
-        try:
-            os.write(descriptor, key)
-            os.fsync(descriptor)
-        finally:
-            os.close(descriptor)
-        return key
+        return self._guard.fingerprint
