@@ -135,7 +135,17 @@ def test_checkpoint_and_events_never_contain_root_key(tmp_path: Path) -> None:
     assert (tmp_path / "root.key").exists() is False  # injected test keys are never persisted
 
 
-def test_production_root_key_is_random_and_locally_protected(tmp_path: Path) -> None:
+def test_production_root_key_is_random_and_locally_protected(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    open_flags: list[int] = []
+    real_open = os.open
+
+    def recording_open(path: str | bytes | os.PathLike[str] | os.PathLike[bytes],
+                       flags: int, mode: int = 0o777) -> int:
+        open_flags.append(flags)
+        return real_open(path, flags, mode)
+
+    monkeypatch.setattr(os, "open", recording_open)
     first = tmp_path / "first"
     second = tmp_path / "second"
     organism = TMCOSystem(first, DeterministicCognitionFixture())
@@ -146,6 +156,7 @@ def test_production_root_key_is_random_and_locally_protected(tmp_path: Path) -> 
     assert material != (second / "root.key").read_bytes()
     if os.name == "nt":
         # A DPAPI blob is not the 32-byte plaintext secret.
+        assert any(flags & os.O_BINARY for flags in open_flags)
         assert len(material) > 32
         assert material != bytes.fromhex(organism.root.key_fingerprint)
     else:

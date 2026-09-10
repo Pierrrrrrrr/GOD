@@ -82,7 +82,8 @@ class WindowsRootSecretStore(RootSecretStore):
         self._unavailable(existing_organism)
         secret = os.urandom(32)
         protected = self._protect(secret)
-        descriptor = os.open(self.path, os.O_WRONLY | os.O_CREAT | os.O_EXCL)
+        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_BINARY", 0)
+        descriptor = os.open(self.path, flags)
         try:
             os.write(descriptor, protected)
             os.fsync(descriptor)
