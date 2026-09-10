@@ -13,7 +13,7 @@ from .executive import (ActionExecutor, ActionResult, Cognition, ExecutiveKernel
 from .memory import MemoryKernel
 from .morphogenesis import AssemblyFormationPolicy
 from .persistence import EventStore
-from .root import AuthorizationError, RootKernel, RootKeyStore
+from .root import AuthorizationError, RootGuard, RootKernel, root_secret_store
 from .runtime import Colony
 from .types import (AssemblyPurpose, ComputeBudget, DigitalNeuron, Goal, GoalStatus,
                     Neuromodulators, Synapse, WorkspaceItem)
@@ -32,11 +32,12 @@ class TMCOSystem:
         self.model_bus, self.body_bus = ModelBus(), BodyBus()
         saved = self.store.recover_state()
         injected = secret.encode() if isinstance(secret, str) else secret
-        root_key = RootKeyStore(path, injected).load_or_create(existing_organism=saved is not None)
+        root_guard = (RootGuard(injected) if injected is not None else
+                      root_secret_store(path).load_or_create(existing_organism=saved is not None))
         if saved:
-            self._restore(saved, root_key)
+            self._restore(saved, root_guard)
         else:
-            self.root = RootKernel(owner, root_key)
+            self.root = RootKernel(owner, root_guard)
             self.root.record("root_initialized", {"owner": owner,
                                                    "key_fingerprint": self.root.key_fingerprint})
             self.colonies = {name: Colony.create(name) for name in ("Saphira-A", "Saphira-B")}
@@ -169,12 +170,11 @@ class TMCOSystem:
                 "goals": {k: {**asdict(v), "success_criteria": list(v.success_criteria),
                                "status": v.status.value} for k, v in self.goals.items()}, "idle": self.idle}
 
-    def _restore(self, state: dict[str, Any], root_key: bytes) -> None:
+    def _restore(self, state: dict[str, Any], root_guard: RootGuard) -> None:
         root = state["root"]
-        fingerprint = hashlib.sha256(root_key).hexdigest()
-        if fingerprint != root["key_fingerprint"]:
+        if root_guard.fingerprint != root["key_fingerprint"]:
             raise AuthorizationError("root key does not match checkpoint verification material")
-        self.root = RootKernel(root["owner"], root_key, root["key_reference"])
+        self.root = RootKernel(root["owner"], root_guard, root["key_reference"])
         self.root.audit = root["audit"]
         if not self.root.verify_audit():
             raise AuthorizationError("root audit verification failed")

@@ -5,9 +5,12 @@ Saphira-A and Saphira-B. Each owns its neurons, synapses, lineage, local memorie
 and assemblies. Cross-colony edges are invalid. Only explicitly salient, bounded
 items enter the shared Global Workspace.
 
-`RootKernel` is the signed authorization boundary. A random key lives in a mode-0600
-file separate from checkpoint/event state; checkpoints contain only its fingerprint
-and reference. The HMAC-chained audit detects mutation, and restored permissions are
+`RootKernel` is the signed authorization boundary. `RootSecretStore` keeps its random
+32-byte secret separate from checkpoint/event state: a mode-0600 file on POSIX and a
+DPAPI current-user protected blob on Windows. Only `RootGuard` temporarily holds the
+plaintext and it exposes fingerprint, sign, and verify operations; checkpoints contain
+only the fingerprint and reference. The HMAC-chained audit detects mutation, and
+restored permissions are
 derived from signed grants rather than trusted checkpoint claims. Cognition cannot
 grant permission or target root policy through evolution. `Colony` is the
 morphogenetic runtime: lightweight persistent cells
@@ -38,3 +41,16 @@ durable before learning, and retries reuse the same executor idempotency key.
 Architectural evolution always branches a candidate from the champion, then requires
 sandbox benchmark and sister audit data before an explicit promote/reject decision.
 The root is outside this mechanism.
+
+Phase 2 awakening data uses a separate SQLite WAL store for conversations, interpreted
+goals, colony positions, model capability and call observations, assemblies, approvals,
+and prediction/outcome learning records. The Phase 1 event and checkpoint format remains
+the authority for organism identity and is restart-compatible. `ModelBackedCognition`
+routes provider-neutral structured requests using observed quality, cost, latency,
+privacy, and failures. Important or uncertain goals receive independent colony
+interpretations and selective sister audit; inexpensive conversation uses one call.
+
+The local loopback web interface is demand-driven and sleeps in the HTTP server while
+idle. Its credential vault is distinct from `RootGuard`; on Windows credentials are
+DPAPI current-user protected. The interface answers questions about activity from
+persisted runtime records rather than asking a model to invent internal progress.

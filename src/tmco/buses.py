@@ -9,7 +9,9 @@ class ProviderUnavailable(RuntimeError):
 
 
 class ModelProvider(Protocol):
+    test_only: bool
     def infer(self, request: dict[str, Any]) -> dict[str, Any]: ...
+    def models(self) -> list[dict[str, Any]]: ...
 
 
 @dataclass(slots=True)
@@ -24,13 +26,26 @@ class OrganManifest:
 
 
 class ModelBus:
-    def __init__(self, providers: dict[str, ModelProvider] | None = None):
-        self.providers = providers or {}
+    def __init__(self, providers: dict[str, ModelProvider] | None = None, *, production: bool = True):
+        self.providers: dict[str, ModelProvider] = {}
+        self.production = production
+        for name, provider in (providers or {}).items():
+            self.register(name, provider)
+
+    def register(self, name: str, provider: ModelProvider) -> None:
+        if self.production and getattr(provider, "test_only", False):
+            raise ProviderUnavailable("test-only model providers cannot be registered in production")
+        self.providers[name] = provider
 
     def request(self, provider: str, request: dict[str, Any]) -> dict[str, Any]:
         if provider not in self.providers:
             raise ProviderUnavailable(f"model provider {provider!r} is not configured")
         return self.providers[provider].infer(request)
+
+    def models(self, provider: str) -> list[dict[str, Any]]:
+        if provider not in self.providers:
+            raise ProviderUnavailable(f"model provider {provider!r} is not configured")
+        return self.providers[provider].models()
 
 
 class BodyBus:
@@ -48,4 +63,3 @@ class BodyBus:
         if handler is None:
             raise ProviderUnavailable(f"organ operation {organ}.{operation} is not configured")
         return handler(arguments)
-

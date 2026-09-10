@@ -1,6 +1,9 @@
 """Deterministic cognition fixtures for tests and local demonstration only."""
 from __future__ import annotations
 
+import json
+from typing import Any
+
 from .executive import ActionResult, Observation
 from .types import ActionCandidate, Goal
 
@@ -36,3 +39,31 @@ class DeterministicObservationFixture:
     def observe(self, result: ActionResult) -> Observation:
         return Observation(result.action_id, f"fixture evidence: {result.output['result']}",
                            "deterministic-test-fixture")
+
+
+class FakeProvider:
+    """Scriptable model provider which ModelBus rejects in production mode."""
+
+    test_only = True
+
+    def __init__(self, *, confidence: float = .7, hypothesis: str = "inspect evidence"):
+        self.confidence = confidence
+        self.hypothesis = hypothesis
+        self.calls: list[dict[str, Any]] = []
+
+    def infer(self, request: dict[str, Any]) -> dict[str, Any]:
+        self.calls.append(request)
+        prompt = request["messages"][-1]["content"]
+        colony = "Saphira-B" if "Saphira-B" in prompt else "Saphira-A"
+        value = {"desired_outcome": "achieve the requested outcome",
+                 "success_evidence": ["observable evidence"], "constraints": [],
+                 "unknowns": ["current conditions"], "subgoals": ["gather evidence"],
+                 "risks": ["insufficient evidence"],
+                 "next_useful_step": f"{colony} gathers targeted evidence",
+                 "confidence": self.confidence,
+                 "hypothesis": f"{self.hypothesis} from {colony}"}
+        return {"choices": [{"message": {"content": json.dumps(value)}}],
+                "usage": {"prompt_tokens": 10, "completion_tokens": 20}}
+
+    def models(self) -> list[dict[str, Any]]:
+        return [{"id": "fake-model"}]
