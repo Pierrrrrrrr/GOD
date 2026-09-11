@@ -178,6 +178,13 @@ class RootKernel:
             previous = entry["signature"]
         return True
 
+    def sign_owner_capability(self, payload: bytes) -> str:
+        """Domain-separated signing for the host-side capability authority only."""
+        return self._guard.sign(b"GOD:OWNER-CAPABILITY:v1\0" + payload)
+
+    def verify_owner_capability(self, payload: bytes, signature: str) -> bool:
+        return self._guard.verify(b"GOD:OWNER-CAPABILITY:v1\0" + payload, signature)
+
     @property
     def key_fingerprint(self) -> str:
         return self._guard.fingerprint

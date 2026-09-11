@@ -113,6 +113,18 @@ class ModelRouter:
         return max(candidates, key=score)
 
     @staticmethod
+    def reason(record: ModelRecord, task: str, policy: str = "AUTO") -> str:
+        """A short, inspectable routing explanation based only on routing evidence."""
+        parts = [f"available for {task}"]
+        if record.privacy == "local": parts.append("local privacy")
+        if record.input_cost == 0 and record.output_cost == 0: parts.append("zero catalog cost")
+        if record.task_performance.get(task) is not None: parts.append("verified task quality")
+        elif record.successes: parts.append("observed provider reliability")
+        if record.latency_ms: parts.append(f"{record.latency_ms:.0f} ms observed latency")
+        if policy != "AUTO": parts.append(f"{policy.lower().replace('_', ' ')} policy")
+        return "; ".join(parts)
+
+    @staticmethod
     def observe_call(record: ModelRecord, success: bool, latency_ms: float) -> None:
         """Record transport/schema health, never cognitive correctness."""
         record.last_tested = time.time()

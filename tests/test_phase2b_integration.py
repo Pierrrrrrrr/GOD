@@ -134,6 +134,10 @@ def test_approval_resumes_exact_demand_and_deny_never_fakes_action(tmp_path: Pat
     runtime.organ_registry.register(manifest,{"mutate":lambda inputs: effects.append(dict(inputs)) or {"receipt":"ok"}})
     episode=runtime.submit_goal("Approval required for controlled mutation")
     assert episode["body"]["status"]=="pending_approval" and not effects
+    before_approval_events=[event["kind"] for event in runtime.timeline()]
+    assert before_approval_events[-1]=="APPROVAL_REQUIRED"
+    assert "PREDICTION_STORED" not in before_approval_events[before_approval_events.index("APPROVAL_REQUIRED"):]
+    assert "ORGAN_STARTED" not in before_approval_events[before_approval_events.index("APPROVAL_REQUIRED"):]
     request=runtime.operational_status()["pending_approval"]; pending=runtime.embodiment_store.all("pending_demand")[-1]
     original={key:pending[key] for key in ("id","decision_provenance_id","expected_output","expected_evidence","confidence","goal_value","information_gain","capability_gain","uncertainty","risk","budget","network_need","filesystem_need","reversible","inputs")}
     before=sum(n.verified_contribution for c in runtime.organism.colonies.values() for n in c.neurons.values())
@@ -144,6 +148,10 @@ def test_approval_resumes_exact_demand_and_deny_never_fakes_action(tmp_path: Pat
     assert prediction["decision_provenance_id"]==original["decision_provenance_id"]
     assert (prediction["expected"],prediction["expected_evidence"],prediction["confidence"],prediction["expected_value"],prediction["information_gain"],prediction["capability_gain"],prediction["uncertainty"]) == ("mutated result","controlled receipt",.73,4.2,.31,.12,.27)
     assert runtime.operational_status()["current_step"]=="AWAITING_OUTCOME"
+    resumed=[event["kind"] for event in runtime.timeline()]
+    expected=["PREDICTION_STORED","ORGAN_STARTED","OBSERVATION_RECEIVED","VERIFICATION_CHANGED","OUTCOME_AWAITING"]
+    positions=[max(i for i,kind in enumerate(resumed) if kind==wanted) for wanted in expected]
+    assert positions==sorted(positions)
     assert sum(n.verified_contribution for c in runtime.organism.colonies.values() for n in c.neurons.values())==before
     assert runtime.evaluate_outcome(OutcomeEvaluation(observation["action_id"],"OBJECTIVE_TEST",("receipt:1",),True,"pass",time.time(),"controlled receipt"))
     assert runtime.operational_status()["current_step"]=="OUTCOME_VERIFIED"

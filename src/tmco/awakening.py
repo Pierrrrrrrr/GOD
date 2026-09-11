@@ -10,6 +10,7 @@ from typing import Any
 from uuid import uuid4
 
 from .buses import BodyBus, ModelBus, ModelProvider, OrganManifest, ProviderUnavailable
+from .capabilities import OwnerCapabilityAuthority
 from .embodiment import (ActionLoop, CapabilityDemand, CapabilityResolver, EmbodimentStore,
                          DecisionProvenance, HumanApprovalRequest, ObservationEnvelope,
                          OrganRegistry, OutcomeEvaluation, OutcomeEvaluator, PermissionAuthority,
@@ -33,6 +34,18 @@ class AwakeningStore:
         CREATE TABLE IF NOT EXISTS chat(id INTEGER PRIMARY KEY, role TEXT, content TEXT, created REAL);
         CREATE TABLE IF NOT EXISTS episodes(id TEXT PRIMARY KEY, goal_id TEXT, state TEXT, created REAL);
         CREATE TABLE IF NOT EXISTS models(key TEXT PRIMARY KEY, state TEXT);
+        CREATE TABLE IF NOT EXISTS settings(key TEXT PRIMARY KEY, value TEXT);
+        CREATE TABLE IF NOT EXISTS runtime_events(
+          sequence INTEGER PRIMARY KEY AUTOINCREMENT, kind TEXT NOT NULL,
+          summary TEXT NOT NULL, state TEXT NOT NULL, created REAL NOT NULL);
+        CREATE TABLE IF NOT EXISTS model_selections(
+          id TEXT PRIMARY KEY, goal_id TEXT, episode_id TEXT, task_class TEXT,
+          colony TEXT, provider TEXT, model_id TEXT, routing_policy TEXT,
+          routing_reason TEXT, started_at REAL, finished_at REAL, latency_ms REAL,
+          success INTEGER);
+        CREATE TABLE IF NOT EXISTS sister_states(
+          sequence INTEGER PRIMARY KEY AUTOINCREMENT,colony TEXT,goal_id TEXT,status TEXT,
+          summary TEXT,confidence REAL,created REAL);
         """)
         self.connection.commit()
 
@@ -60,6 +73,31 @@ class AwakeningStore:
         self.connection.commit()
         self.connection.execute("PRAGMA wal_checkpoint(TRUNCATE)")
         self.connection.close()
+
+    def setting(self, key: str, default: str) -> str:
+        row = self.connection.execute("SELECT value FROM settings WHERE key=?", (key,)).fetchone()
+        return str(row[0]) if row else default
+
+    def set_setting(self, key: str, value: str) -> None:
+        self.connection.execute("INSERT OR REPLACE INTO settings VALUES(?,?)", (key, value))
+        self.connection.commit()
+
+    def runtime_event(self, kind: str, summary: str, state: dict[str, Any]) -> None:
+        """Persist an event only when called by a completed runtime transition."""
+        self.connection.execute("INSERT INTO runtime_events(kind,summary,state,created) VALUES(?,?,?,?)",
+                                (kind, summary, json.dumps(state), time.time()))
+        self.connection.commit()
+
+    def model_selection(self, value: dict[str, Any]) -> None:
+        columns = ("id","goal_id","episode_id","task_class","colony","provider","model_id",
+                   "routing_policy","routing_reason","started_at","finished_at","latency_ms","success")
+        self.connection.execute(f"INSERT OR REPLACE INTO model_selections VALUES({','.join('?' for _ in columns)})",
+                                tuple(value.get(key) for key in columns)); self.connection.commit()
+
+    def sister_state(self, colony: str, goal_id: str | None, status: str, summary: str,
+                     confidence: float | None) -> None:
+        self.connection.execute("INSERT INTO sister_states(colony,goal_id,status,summary,confidence,created) VALUES(?,?,?,?,?,?)",
+                                (colony, goal_id, status, summary, confidence, time.time())); self.connection.commit()
 
 
 class ModelBackedCognition(Cognition):
@@ -124,15 +162,22 @@ class GodRuntime:
         self.organism = TMCOSystem(directory / "organism", self.cognition, secret=secret,
                                    formation_policy=self.policy)
         self.store = AwakeningStore(directory / "awakening.sqlite3")
+        self.routing_policy = self.store.setting("routing_policy", "AUTO")
         self.body_bus = BodyBus()
         self.embodiment_store = EmbodimentStore(directory / "embodiment.sqlite3")
         self.organ_registry = OrganRegistry(self.body_bus, self.embodiment_store)
         self.capability_resolver = CapabilityResolver(self.body_bus, self.embodiment_store)
-        self.action_loop = ActionLoop(self.body_bus, self.embodiment_store)
+        self.action_loop = ActionLoop(self.body_bus, self.embodiment_store, self._action_event)
         self.permission_authority = PermissionAuthority(self.embodiment_store)
+        self.owner_capabilities = OwnerCapabilityAuthority(self.organism.root,
+                                                           directory / "owner_capabilities.sqlite3")
         self.sister_exchange = SisterExchangePolicy()
         self._restore_exchange_rounds()
         self._register_builtin_organs(web_test_allow_hosts)
+        self._event("BOOT", "Root and both sister lineages restored")
+        for name in ("Saphira-A", "Saphira-B"):
+            if not self.store.rows("SELECT 1 FROM sister_states WHERE colony=? LIMIT 1", (name,)):
+                self._sister_transition(name, None, "IDLE", "Awake and idle")
         if providers or records:
             self.attach_intelligence(providers or {}, records or [])
 
@@ -149,6 +194,15 @@ class GodRuntime:
             capability_tags={"web"}, network_scope=("public-http-test" if test_hosts else "public-https",), verified_reliability=.8)
         self.organ_registry.register(web_manifest, {method: (lambda args, method=method: web.request({**args, "method": method})) for method in ("GET", "HEAD")})
 
+    def _action_event(self, kind: str, state: dict[str, Any]) -> None:
+        summaries = {"APPROVAL_REQUIRED": "Pier approval required",
+                     "PREDICTION_STORED": "Action prediction persisted",
+                     "ORGAN_STARTED": "Body organ invocation started",
+                     "OBSERVATION_RECEIVED": "Body observation persisted",
+                     "VERIFICATION_CHANGED": "Observation verification changed",
+                     "FAILED": "Body invocation failed"}
+        self._event(kind, summaries[kind], state)
+
     def _restore_exchange_rounds(self) -> None:
         for event in self.embodiment_store.all("exchange"):
             self.sister_exchange.rounds[event["goal_id"]] = max(
@@ -162,6 +216,8 @@ class GodRuntime:
         if policy not in {"AUTO", "FREE_FIRST", "LOCAL_FIRST"}:
             raise ValueError("unknown routing policy")
         self.routing_policy = policy
+        self.store.set_setting("routing_policy", policy)
+        self._event("ROUTING", f"Routing policy changed to {policy}")
 
     def attach_intelligence(self, providers: dict[str, ModelProvider],
                             records: list[ModelRecord]) -> None:
@@ -180,12 +236,14 @@ class GodRuntime:
         self.cognition = ModelBackedCognition(self.bus, initial)
         self.organism.executive.cognition = self.cognition
         self._save_models()
+        self._event("INTELLIGENCE", f"Connected {len(configured)} discovered model(s)")
 
     def detach_intelligence(self) -> None:
         self.bus = ModelBus(production=True)
         self.records = {}
         self.cognition = DisconnectedCognition()
         self.organism.executive.cognition = self.cognition
+        self._event("INTELLIGENCE", "External intelligence disconnected")
 
     def _restore_models(self) -> None:
         for row in self.store.rows("SELECT state FROM models"):
@@ -197,28 +255,62 @@ class GodRuntime:
             if record.key in self.records:
                 self.records[record.key] = record
 
+    def _model_call(self, record: ModelRecord, goal_id: str | None, episode_id: str | None,
+                    task: str, colony: str | None, demand: str, context: dict[str, Any]) -> dict[str, Any]:
+        identity, started_wall, started = uuid4().hex, time.time(), time.monotonic()
+        selection = {"id": identity, "goal_id": goal_id, "episode_id": episode_id,
+                     "task_class": task, "colony": colony, "provider": record.provider,
+                     "model_id": record.model_id, "routing_policy": self.routing_policy,
+                     "routing_reason": self.router.reason(record, task, self.routing_policy),
+                     "started_at": started_wall, "finished_at": None, "latency_ms": None,
+                     "success": None}
+        self.store.model_selection(selection)
+        self._event("MODEL_SELECTED", f"{record.key} selected for {task}",
+                    {key: selection[key] for key in ("id", "goal_id", "episode_id", "task_class", "colony",
+                                                     "provider", "model_id", "routing_policy", "routing_reason")})
+        try:
+            result = ModelBackedCognition(self.bus, record).ask(demand, context); success = True
+            return result
+        except Exception:
+            success = False; raise
+        finally:
+            latency = (time.monotonic() - started) * 1000
+            selection.update(finished_at=time.time(), latency_ms=latency, success=int(success))
+            self.store.model_selection(selection); self.router.observe_call(record, success, latency)
+
+    def _sister_transition(self, colony: str, goal_id: str | None, status: str, summary: str) -> None:
+        confidence = round(sum(n.confidence for n in self.organism.colonies[colony].neurons.values()) /
+                           len(self.organism.colonies[colony].neurons), 3)
+        self.store.sister_state(colony, goal_id, status, summary, confidence)
+
     def submit_goal(self, text: str, *, important: bool = True) -> dict[str, Any]:
         if not text.strip():
             raise ValueError("a natural-language goal is required")
         if not self.intelligence_connected:
             raise ProviderUnavailable("external intelligence is disconnected")
-        goal_id = uuid4().hex
+        goal_id, episode_id = uuid4().hex, uuid4().hex
+        self._event("GOAL_ACCEPTED", "Owner goal accepted", {"goal_id": goal_id})
         goal = Goal(goal_id, text, ("credible evidence of progress",))
         work_class = classify_work(text)
+        self._event("WORK_CLASS_SELECTED", f"Work classified as {work_class.value}", {"goal_id": goal_id})
         decisions = self.policy.form(self.organism.colonies, goal,
                                      {name: ComputeBudget(8) for name in self.organism.colonies})
         interpretations: dict[str, dict[str, Any]] = {}
         used: set[str] = set()
         colonies = (list(self.organism.colonies.items()) if work_class == WorkClass.DELIBERATIVE and important
                     else [self._dynamic_primary(text)])
+        primary_colony = colonies[0][0]
+        self._event("PRIMARY_COLONY_SELECTED", f"{primary_colony} selected as primary", {"goal_id": goal_id,
+                    "colony": primary_colony})
         for name, colony in colonies:
             record = self.router.choose(list(self.records.values()), "goal_reasoning", exclude=used,
                                         policy=self.routing_policy)
             used.add(record.key)
-            started = time.monotonic()
-            cognition = ModelBackedCognition(self.bus, record)
+            self._sister_transition(name, goal_id, "THINKING", "Independent goal interpretation started")
+            self._event("SISTER_A_STARTED" if name == "Saphira-A" else "SISTER_B_STARTED",
+                        f"{name} independent pass started", {"goal_id": goal_id, "colony": name})
             try:
-                answer = cognition.ask(
+                answer = self._model_call(record, goal_id, episode_id, "goal_reasoning", name,
                     "Reason independently as this persistent colony. Infer desired_outcome, success_evidence, "
                     "constraints, unknowns, risks, subgoals, hypotheses, and next_useful_action. Do not assume "
                     "the other colony's view. If external information or action is needed, return body_demands as "
@@ -228,19 +320,20 @@ class GodRuntime:
                     "empty body_demands list when no body capability is needed. Describe WHAT is required only; "
                     "never request shell or arbitrary code execution and never claim prose is an executed action.",
                     {"colony": name, "identity": colony.id, "goal": text})
-                self.router.observe_call(record, True, (time.monotonic() - started) * 1000)
             except Exception:
-                self.router.observe_call(record, False, (time.monotonic() - started) * 1000)
+                self._sister_transition(name, goal_id, "BLOCKED", "Model call failed")
+                self._event("FAILED", f"{name} model call failed", {"goal_id": goal_id, "colony": name})
                 self._save_models(); raise
             interpretations[name] = {"model": record.key, "argument": answer}
+            self._event("SISTER_RESULT_READY", f"{name} result ready", {"goal_id": goal_id, "colony": name})
+            self._sister_transition(name, goal_id, "IDLE", "Independent result ready")
         candidate_disagreement = self._candidate_disagreement(interpretations)
         material_disagreement = False
         materiality_reasons: list[str] = []
         if candidate_disagreement:
             record = self.router.choose(list(self.records.values()), "disagreement_assessment",
                                         policy=self.routing_policy)
-            started = time.monotonic()
-            assessment = ModelBackedCognition(self.bus, record).ask(
+            assessment = self._model_call(record, goal_id, episode_id, "disagreement_assessment", None,
                 "Assess only whether these core claims conflict enough to change the decision. Return a JSON "
                 "boolean material_disagreement and a list of reasons. Cosmetic wording is not material.",
                 {"goal": text, "core_claims": self._core_claims(interpretations)})
@@ -249,19 +342,16 @@ class GodRuntime:
                 raise ValueError("disagreement assessment must return a boolean material_disagreement")
             material_disagreement = decision
             materiality_reasons = [str(reason) for reason in assessment.get("reasons", [])]
-            self.router.observe_call(record, True, (time.monotonic() - started) * 1000)
         audit = None
         if material_disagreement:
             record = self.router.choose(list(self.records.values()), "sister_audit",
                                         policy=self.routing_policy)
-            started = time.monotonic()
-            audit = ModelBackedCognition(self.bus, record).ask(
+            audit = self._model_call(record, goal_id, episode_id, "sister_audit", None,
                 "Act as a separate sister-audit demand. Identify material disagreements, assess each argument "
                 "against the goal, and return disagreements, synthesis, selected_next_action, and rationale.",
                 {"goal": text, "independent_arguments": interpretations})
-            self.router.observe_call(record, True, (time.monotonic() - started) * 1000)
-        exchange = self._integrated_exchange(goal_id, text, interpretations, material_disagreement)
-        episode = {"id": uuid4().hex, "goal_id": goal_id, "goal": text,
+        exchange = self._integrated_exchange(goal_id, episode_id, text, interpretations, material_disagreement)
+        episode = {"id": episode_id, "goal_id": goal_id, "goal": text,
                    "interpretations": interpretations,
                    "candidate_disagreement": candidate_disagreement,
                    "material_disagreement": material_disagreement,
@@ -273,6 +363,7 @@ class GodRuntime:
                  "next_action": (audit or next(iter(interpretations.values()))["argument"]).get(
                      "selected_next_action", next(iter(interpretations.values()))["argument"].get("next_useful_action")),
                  "episode_id": episode["id"], "work_class": work_class.value, "current_step": "reasoning",
+                 "selected_colony": primary_colony,
                  "current_organ": None, "last_observation": None, "exchange_status": "completed" if exchange else "none"}
         self.store.put("goals", goal_id, state)
         self.store.put("episodes", episode["id"], episode)
@@ -284,6 +375,8 @@ class GodRuntime:
         if demands:
             episode["body"] = self._run_body_plan(state, demands, interpretations)
             self.store.put("episodes", episode["id"], episode)
+        if not demands or episode.get("body", {}).get("status") == "executed":
+            self._event("FINAL_RESPONSE", "Synchronous goal response returned", {"goal_id": goal_id})
         return episode
 
     def _dynamic_primary(self, text: str) -> tuple[str, Any]:
@@ -299,9 +392,12 @@ class GodRuntime:
             return (relevance*2 + verified + confidence + novelty + borrowed - cost*.1, name)
         return max(self.organism.colonies.items(), key=score)
 
-    def _integrated_exchange(self, goal_id: str, goal: str, interpretations: dict[str, dict[str, Any]], triggered: bool) -> dict[str, Any] | None:
+    def _integrated_exchange(self, goal_id: str, episode_id: str, goal: str, interpretations: dict[str, dict[str, Any]], triggered: bool) -> dict[str, Any] | None:
         if not triggered or len(interpretations) < 2: return None
         names = list(interpretations); source, target = names[0], names[1]
+        self._event("SISTER_EXCHANGE_STARTED", "Bounded sister exchange started", {"goal_id": goal_id})
+        self._sister_transition(source, goal_id, "EXCHANGING", "Sharing bounded sister brief")
+        self._sister_transition(target, goal_id, "EXCHANGING", "Reviewing bounded sister brief")
         argument = interpretations[source]["argument"]
         brief = SisterBrief(source, str(argument.get("hypotheses", [""])[0]), str(argument.get("next_useful_action", "")),
                             tuple(map(str, argument.get("evidence_refs", ()))), float(argument.get("confidence", .5)),
@@ -311,7 +407,7 @@ class GodRuntime:
         # This is a genuinely new post-brief turn. It contains the compact brief and
         # goal only—not the source interpretation, private memory, or topology.
         target_record = self.records[interpretations[target]["model"]]
-        post = ModelBackedCognition(self.bus, target_record).ask(
+        post = self._model_call(target_record, goal_id, episode_id, "sister_exchange", target,
             "Respond to this SisterBrief after your independent first pass. Return response as exactly ACCEPT, "
             "CHALLENGE, IGNORE, or COUNTERPROPOSE, plus reason, updated_confidence, optional counterproposal, "
             "and evidence_refs.", {"goal": goal, "sister_brief": asdict(brief)})
@@ -323,7 +419,10 @@ class GodRuntime:
         event = {"goal_id": goal_id, "round": self.sister_exchange.rounds[goal_id], "source": source, "target": target,
                  "brief": asdict(brief), "response": response.value, "post_brief_response": post,
                  "minority_hypotheses": target_view.minority_hypotheses}
-        self.embodiment_store.put("exchange", f"{goal_id}:{event['round']}", event); return event
+        self.embodiment_store.put("exchange", f"{goal_id}:{event['round']}", event)
+        self._event("SISTER_EXCHANGE_RESULT", "Bounded sister exchange recorded", {"goal_id": goal_id})
+        for name in (source, target): self._sister_transition(name, goal_id, "IDLE", "Exchange complete")
+        return event
 
     def _structured_demands(self, goal_id: str, episode_id: str, task: str,
                             interpretations: dict[str, dict[str, Any]], decisions: list[Any]) -> list[tuple[float, CapabilityDemand, dict[str, Any]]]:
@@ -348,6 +447,8 @@ class GodRuntime:
                     view["model"], assembly_ids, neuron_ids, demand.id, time.time())
                 demand.decision_provenance_id = provenance.id
                 self.embodiment_store.put("decision_provenance", provenance.id, provenance)
+                self._event("CAPABILITY_DEMAND_CREATED", f"{source_colony} requested {demand.required_capability}",
+                            {"goal_id": goal_id, "demand_id": demand.id, "colony": source_colony})
                 utility = float(data.get("goal_value",1))+float(data.get("information_gain",.5))+float(data.get("capability_gain",0)) \
                     - float(data["budget"])-float(data["risk"])-(0 if data["reversibility"] else 1)-float(data.get("uncertainty",1-float(data["confidence"])))
                 candidates.append((utility, demand, data))
@@ -362,15 +463,34 @@ class GodRuntime:
         for _, demand, raw in candidates:
             if demand.intent in seen: continue
             seen.add(demand.intent)
+            provenance = next((item for item in self.embodiment_store.all("decision_provenance")
+                               if item["id"] == demand.decision_provenance_id), {})
+            acting_colony = provenance.get("source_colony")
             if evidence and isinstance(demand.inputs.get("content"), str): demand.inputs["content"] = demand.inputs["content"].replace("{evidence}", evidence[:8000])
             state.update(current_step="body_execution", current_organ=None); self.store.put("goals", state["id"], state)
             resolved = self.capability_resolver.resolve(demand)
-            if resolved: state["current_organ"] = resolved[0].id; self.store.put("goals", state["id"], state)
+            if resolved:
+                state["current_organ"] = resolved[0].id; self.store.put("goals", state["id"], state)
+                self._event("CAPABILITY_RESOLVED", f"Demand resolved to {resolved[0].id}",
+                            {"goal_id": state["id"], "organ": resolved[0].id})
             result = self.action_loop.execute(demand)
-            if isinstance(result, HumanApprovalRequest): state.update(current_step="pending_approval", pending_approval=result.id); self.store.put("goals",state["id"],state); return {"status":"pending_approval","request":asdict(result)}
-            if not isinstance(result, ObservationEnvelope): state.update(current_step="capability_gap"); self.store.put("goals",state["id"],state); return {"status":"gap"}
+            if isinstance(result, HumanApprovalRequest):
+                state.update(current_step="pending_approval", pending_approval=result.id); self.store.put("goals",state["id"],state)
+                if acting_colony: self._sister_transition(acting_colony, state["id"], "WAITING", "Waiting for Pier approval")
+                return {"status":"pending_approval","request":asdict(result)}
+            if not isinstance(result, ObservationEnvelope):
+                state.update(current_step="capability_gap"); self.store.put("goals",state["id"],state)
+                self._event("CAPABILITY_GAP", "No safe compatible organ", {"goal_id": state["id"], "demand_id": demand.id})
+                return {"status":"gap"}
+            if acting_colony: self._sister_transition(acting_colony, state["id"], "ACTING", "Body operation invoked")
+            if acting_colony: self._sister_transition(acting_colony, state["id"], "VERIFYING", "Checking body observation")
             level = VerificationLevel.TRANSPORT_VERIFIED if demand.required_capability == "web" else VerificationLevel.ARTIFACT_VERIFIED
             verified = self.action_loop.verify(result, lambda obs: obs.success and bool(obs.content_hash), level)
+            if not result.success:
+                state.update(status="failed", current_step="FAILED", last_observation=result.action_id)
+                self.store.put("goals", state["id"], state)
+                if acting_colony: self._sister_transition(acting_colony, state["id"], "BLOCKED", "Body invocation failed")
+                return {"status": "failed", "observations": [asdict(result)]}
             if verified:
                 manifest = self.body_bus.manifests[result.organ]
                 manifest.verified_reliability = min(1, manifest.verified_reliability + .01)
@@ -387,7 +507,9 @@ class GodRuntime:
             if verified:
                 evidence = result.result.get("text", json.dumps(result.result)) if isinstance(result.result, dict) else str(result.result)
             state["current_step"] = "verified" if verified else "replan"; self.store.put("goals",state["id"],state)
+            if acting_colony: self._sister_transition(acting_colony, state["id"], "IDLE", "Body step complete")
         state["status"] = "awaiting_outcome"; state["current_step"] = "AWAITING_OUTCOME"; self.store.put("goals",state["id"],state)
+        self._event("OUTCOME_AWAITING", "Body result awaits outcome evidence", {"goal_id": state["id"]})
         self.organism.memory.world_model["last_body_outcome"] = {"observations": observations,
             "verification_level": VerificationLevel.ARTIFACT_VERIFIED.value}
         self.organism._commit_state("observed_body_execution")
@@ -422,6 +544,7 @@ class GodRuntime:
         if goal_rows:
             goal = json.loads(goal_rows[0]["state"]); goal.update(status="outcome_verified", current_step="OUTCOME_VERIFIED")
             self.store.put("goals", observation.goal_id, goal)
+        self._event("OUTCOME_VERIFIED", "External outcome evidence verified", {"goal_id": observation.goal_id})
         self.organism._commit_state("outcome_verified_learning"); self._save_models(); return True
 
     def respond_to_digest(self, observation_id: str, sister: str, response: DigestResponse) -> None:
@@ -473,20 +596,61 @@ class GodRuntime:
     def _save_models(self) -> None:
         for record in self.records.values(): self.store.put("models", record.key, asdict(record))
 
+    def _event(self, kind: str, summary: str, state: dict[str, Any] | None = None) -> None:
+        # Deliberately accepts structured operational facts, never prompts, model
+        # reasoning, secrets, memory contents, or private topology.
+        self.store.runtime_event(kind, summary, state or {})
+
+    def timeline(self, limit: int = 50) -> list[dict[str, Any]]:
+        rows = self.store.rows("SELECT sequence,kind,summary,state,created FROM runtime_events "
+                               "ORDER BY sequence DESC LIMIT ?", (max(1, min(limit, 200)),))
+        return [{"sequence": row["sequence"], "kind": row["kind"],
+                 "summary": row["summary"], "state": json.loads(row["state"]),
+                 "created": row["created"]} for row in reversed(rows)]
+
+    def _sister_summary(self, name: str, goal: dict[str, Any], episode: dict[str, Any]) -> dict[str, Any]:
+        row = self.store.rows("SELECT status,summary,confidence,created FROM sister_states WHERE colony=? "
+                              "ORDER BY sequence DESC LIMIT 1", (name,))[0]
+        view = episode.get("interpretations", {}).get(name, {}); argument = view.get("argument", {})
+        selection = self.store.rows("SELECT model_id,provider,latency_ms FROM model_selections WHERE colony=? "
+                                    "ORDER BY started_at DESC LIMIT 1", (name,))
+        selected = selection[0] if selection else {}
+        return {"status": row["status"], "public_summary": row["summary"],
+                "hypothesis": next(iter(argument.get("hypotheses", [])), None), "confidence": row["confidence"],
+                "evidence_count": len(argument.get("success_evidence", [])),
+                "model": f'{selected["provider"]}:{selected["model_id"]}' if selected else None,
+                "organ": goal.get("current_organ"), "latency_ms": selected["latency_ms"] if selected else None}
+
     def operational_status(self) -> dict[str, Any]:
         active = self.store.rows("SELECT state FROM goals ORDER BY rowid DESC LIMIT 1")
         goal = json.loads(active[0]["state"]) if active else {}
+        episode = {}
+        if goal.get("episode_id"):
+            row = self.store.rows("SELECT state FROM episodes WHERE id=?", (goal["episode_id"],))
+            episode = json.loads(row[0]["state"]) if row else {}
         observations = self.embodiment_store.all("observation"); approvals = self.embodiment_store.all("approval")
+        predictions = self.embodiment_store.all("prediction")
         gaps = self.embodiment_store.all("gap"); exchanges = self.embodiment_store.all("exchange")
         confidences = {name: round(sum(n.confidence for n in colony.neurons.values())/len(colony.neurons),3)
                        for name,colony in self.organism.colonies.items()}
         last = observations[-1] if observations else None
+        selected_rows = self.store.rows("SELECT * FROM model_selections ORDER BY started_at DESC LIMIT 1")
+        selected = dict(selected_rows[0]) if selected_rows else None
         return {"current_goal": goal.get("description"), "work_class": goal.get("work_class"),
                 "current_step": goal.get("current_step","idle"), "current_organ": goal.get("current_organ"),
+                "selected_colony": goal.get("selected_colony") or (selected.get("colony") if selected else None),
+                "selected_model": f'{selected["provider"]}:{selected["model_id"]}' if selected else None,
+                "routing_reason": selected.get("routing_reason") if selected else None,
+                "prediction": predictions[-1] if predictions else None,
+                "observation": last, "verification": last.get("verification") if last else None,
+                "approval": next((a for a in reversed(approvals) if a["status"] == "pending"), None),
                 "last_observation": last, "pending_approval": next((a for a in reversed(approvals) if a["status"]=="pending"),None),
                 "capability_gaps": gaps, "a_confidence": confidences["Saphira-A"], "b_confidence": confidences["Saphira-B"],
                 "sister_exchange": exchanges[-1] if exchanges else None,
-                "latest_latency": last.get("latency_ms") if last else None}
+                "latest_latency": last.get("latency_ms") if last else None,
+                "sisters": {name: self._sister_summary(name, goal, episode)
+                            for name in ("Saphira-A", "Saphira-B")},
+                "timeline": self.timeline()}
 
     def decide_approval(self, request_id: str, approve: bool) -> None:
         if not approve:
@@ -514,6 +678,8 @@ class GodRuntime:
             state.update(status="awaiting_outcome", current_step="AWAITING_OUTCOME", current_organ=request["organ"],
                          last_observation=result.action_id, pending_approval=None)
             self.store.put("goals", state["id"], state)
+            self._event("OUTCOME_AWAITING", "Approved body result awaits outcome evidence",
+                        {"goal_id": state["id"], "action_id": result.action_id})
 
     def chat(self, message: str) -> str:
         self.store.chat("user", message)
@@ -537,7 +703,8 @@ class GodRuntime:
             record = self.router.choose(list(self.records.values()), "conversation",
                                         policy=self.routing_policy)
             persisted = json.loads(active[0]["state"]) if active else None
-            result = ModelBackedCognition(self.bus, record).ask(
+            result = self._model_call(record, persisted.get("id") if persisted else None,
+                persisted.get("episode_id") if persisted else None, "conversation", None,
                 "Reply naturally and truthfully. Do not invent activity; use only supplied persisted state.",
                 {"message": message, "active_goal": persisted})
             answer = str(result.get("answer", result.get("response", "I do not have an answer.")))
@@ -562,6 +729,7 @@ class GodRuntime:
 
     def close(self) -> None:
         self.organism.checkpoint()
+        self.owner_capabilities.close()
         self.embodiment_store.close()
         self.store.close()
 
