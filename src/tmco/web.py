@@ -187,7 +187,15 @@ class App:
         lines.append(f"Routing: {self.runtime.routing_policy}")
         active = self.runtime.store.rows(
             "SELECT description FROM goals WHERE status='active' ORDER BY rowid DESC LIMIT 1")
-        if active: lines.append(f"Active goal: {active[0]['description']}")
+        if active:
+            lines.extend((f"Current goal: {active[0]['description']}", "Current step: reasoning",
+                          "Work class: DELIBERATIVE", "Current body organ: none",
+                          "A confidence: pending", "B confidence: pending"))
+        else:
+            lines.extend(("Current goal: none", "Current step: idle", "Work class: REFLEX",
+                          "Current body organ: none", "A confidence: n/a", "B confidence: n/a"))
+        lines.extend(("Last observation: none", "Pending approval: none", "Capability gaps: none",
+                      "Sister exchange: none", "Latest latency: n/a"))
         return "<br>".join(html.escape(line) for line in lines)
 
     def chat(self, message: str) -> str:

@@ -17,6 +17,26 @@ PYTHONPATH=src python scripts/demo.py --reset
 
 The demo uses the deterministic fixture in `tmco.fixtures`; production buses never
 substitute a fake provider.
+
+## Phase 2B embodiment
+
+`tmco.embodiment` expands the existing `BodyBus` with typed capability demand and
+resolution, durable predictions/observations/gaps/approvals/leases, a workspace-confined
+filesystem, SSRF-protected read-only web research, registered OpenAPI operations, and
+honest optional MCP and sandbox boundaries. `tmco.sisters` provides independent-first,
+compact, bounded sister briefs and verified development digests. A completion claim is
+impossible without an observation and verified learning is explicitly outcome-gated.
+
+The production research-to-report path is: persist goal/demand, resolve `web.GET`, persist
+prediction, receive and persist hashed HTTP evidence, independently assess important
+evidence, optionally exchange a compact brief, synthesize, resolve `workspace.write`, and
+verify the output with `workspace.exists`/`workspace.hash`. Network failure produces a
+failed observation rather than research output. Optional MCP SDK and secure sandbox
+providers are not installed automatically.
+
+On Windows, install with `py -3.11 -m pip install -e .`, run tests with
+`py -3.11 -m pytest -q`, and start with `START_GOD.bat`. Shutdown through Ctrl+C (or close
+the UI process) so the runtime checkpoints SQLite WAL and closes its connection cleanly.
 ## Phase 2A awakening (Windows)
 
 Install once with `py -3.11 -m pip install -e .`, then double-click
