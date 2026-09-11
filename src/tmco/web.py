@@ -8,7 +8,7 @@ import sqlite3
 import threading
 import time
 import webbrowser
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs
 
@@ -119,7 +119,8 @@ def serve(data: Path, port: int, *, open_browser: bool = True) -> None:
     app = App(data)
     class Handler(BaseHTTPRequestHandler):
         def page(self) -> None:
-            body = PAGE.format(status=app.status(), chat=html.escape("\n".join(app.transcript))).encode()
+            body = PAGE.replace("{status}", app.status()).replace(
+                "{chat}", html.escape("\n".join(app.transcript))).encode()
             self.send_response(200); self.send_header("Content-Type", "text/html; charset=utf-8")
             self.send_header("Content-Length", str(len(body))); self.end_headers(); self.wfile.write(body)
         def do_GET(self) -> None: self.page()
@@ -136,7 +137,9 @@ def serve(data: Path, port: int, *, open_browser: bool = True) -> None:
             if self.path == "/connect": app.transcript.append(response)
             self.send_response(303); self.send_header("Location", "/"); self.end_headers()
         def log_message(self, format: str, *args: object) -> None: pass
-    server = ThreadingHTTPServer(("127.0.0.1", port), Handler)
+    # The runtime and its SQLite connection are intentionally confined to this
+    # single-user server thread. Browser launching is the only background work.
+    server = HTTPServer(("127.0.0.1", port), Handler)
     if open_browser: threading.Timer(.5, webbrowser.open, (f"http://127.0.0.1:{port}",)).start()
     try: server.serve_forever()
     except KeyboardInterrupt: pass

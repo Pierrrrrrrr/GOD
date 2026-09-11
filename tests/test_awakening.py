@@ -1,4 +1,6 @@
 import json
+import threading
+import urllib.request
 from pathlib import Path
 
 import pytest
@@ -71,6 +73,9 @@ def test_full_awakening_audit_learning_and_restart(tmp_path: Path) -> None:
     learned_specializations = sum(n.specialization != "generalist"
                                   for c in first.organism.colonies.values() for n in c.neurons.values())
     episode2 = first.submit_goal("Find a realistic way to reduce water waste again")
+    expected_a_interpretation = episode2["interpretations"]["Saphira-A"]["argument"]
+    assert first.organism.colonies["Saphira-A"].id != first.organism.colonies["Saphira-B"].id
+    assert set(episode2["interpretations"]) == {"Saphira-A", "Saphira-B"}
     assert policy.calls == 2 and learned_specializations > 0
     # Compare task 2 with an inexperienced organism: the history, not just task wording,
     # changes the state-sensitive colony/assembly decision.
@@ -96,7 +101,7 @@ def test_full_awakening_audit_learning_and_restart(tmp_path: Path) -> None:
     assert any(r.successes for r in restored.records.values())
     assert sum(n.verified_contribution for c in restored.organism.colonies.values()
                for n in c.neurons.values()) == 0
-    assert '"hypotheses": ["A"]' in restored.chat("What does Saphira-A think?")
+    assert json.loads(restored.chat("What does Saphira-A think?")) == expected_a_interpretation
     restored.close()
     # WAL was explicitly checkpointed and all handles are closed, permitting replacement on Windows.
     database = tmp_path / "awakening.sqlite3"
@@ -235,3 +240,40 @@ def test_verified_quality_requires_explicit_outcome() -> None:
     ModelRouter.observe_verified_outcome(record, "planning", True)
     assert record.task_performance["planning"] > .5
     assert record.calibration == 1 and record.quality_observations == 1
+
+
+def test_local_server_get_keeps_sqlite_on_server_thread_and_closes(tmp_path: Path,
+                                                                  monkeypatch: pytest.MonkeyPatch) -> None:
+    from http.server import HTTPServer
+    from tmco.web import serve
+
+    ready = threading.Event()
+    holder: dict[str, HTTPServer] = {}
+
+    class ObservableServer(HTTPServer):
+        def server_activate(self) -> None:
+            super().server_activate()
+            holder["server"] = self
+            ready.set()
+
+    monkeypatch.setattr("tmco.web.HTTPServer", ObservableServer)
+    worker = threading.Thread(target=serve, args=(tmp_path, 0),
+                              kwargs={"open_browser": False})
+    worker.start()
+    assert ready.wait(5)
+    server = holder["server"]
+    try:
+        with urllib.request.urlopen(
+                f"http://127.0.0.1:{server.server_address[1]}/", timeout=5) as response:
+            page = response.read().decode()
+        assert response.status == 200
+        assert "Saphira-A ONLINE" in page
+        assert "Intelligence DISCONNECTED" in page
+    finally:
+        server.shutdown()
+        worker.join(5)
+    assert not worker.is_alive()
+    database = tmp_path / "awakening.sqlite3"
+    moved = database.with_suffix(".moved")
+    database.replace(moved)
+    moved.replace(database)
