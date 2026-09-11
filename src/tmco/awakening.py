@@ -57,11 +57,14 @@ class AwakeningStore:
 
 class ModelBackedCognition(Cognition):
     """Cognitive schema adapter. Identity and learning remain outside the model."""
-    def __init__(self, bus: ModelBus, provider: str):
-        self.bus, self.provider = bus, provider
+    def __init__(self, bus: ModelBus, record: ModelRecord):
+        self.bus, self.record = bus, record
 
     def ask(self, demand: str, context: dict[str, Any]) -> dict[str, Any]:
-        result = self.bus.request(self.provider, {"prompt": demand + "\nJSON context:\n" + json.dumps(context)})
+        result = self.bus.request(self.record.provider, {
+            "model_id": self.record.model_id,
+            "prompt": demand + "\nJSON context:\n" + json.dumps(context),
+        })
         if not isinstance(result, dict):
             raise ValueError("model cognition must return a JSON object")
         return result
@@ -93,7 +96,7 @@ class GodRuntime:
         if not self.records:
             raise RuntimeError("at least one model record is required")
         initial = self.router.choose(list(self.records.values()), "conversation")
-        self.cognition = ModelBackedCognition(self.bus, initial.provider)
+        self.cognition = ModelBackedCognition(self.bus, initial)
         self.policy = formation_policy or AssemblyFormationPolicy()
         # Existing Phase 1 state format remains the authority for organism identity/neural state.
         self.organism = TMCOSystem(directory / "organism", self.cognition, secret=secret,
@@ -122,7 +125,7 @@ class GodRuntime:
             record = self.router.choose(list(self.records.values()), "goal_reasoning", exclude=used)
             used.add(record.key)
             started = time.monotonic()
-            cognition = ModelBackedCognition(self.bus, record.provider)
+            cognition = ModelBackedCognition(self.bus, record)
             try:
                 answer = cognition.ask(
                     "Reason independently as this persistent colony. Infer desired_outcome, success_evidence, "
@@ -133,18 +136,37 @@ class GodRuntime:
                 self.router.learn(record, "goal_reasoning", False, (time.monotonic() - started) * 1000)
                 self._save_models(); raise
             interpretations[name] = {"model": record.key, "argument": answer}
-        disagreement = self._disagree(interpretations)
+        candidate_disagreement = self._candidate_disagreement(interpretations)
+        material_disagreement = False
+        materiality_reasons: list[str] = []
+        if candidate_disagreement:
+            record = self.router.choose(list(self.records.values()), "disagreement_assessment")
+            started = time.monotonic()
+            assessment = ModelBackedCognition(self.bus, record).ask(
+                "Assess only whether these core claims conflict enough to change the decision. Return a JSON "
+                "boolean material_disagreement and a list of reasons. Cosmetic wording is not material.",
+                {"goal": text, "core_claims": self._core_claims(interpretations)})
+            decision = assessment.get("material_disagreement")
+            if not isinstance(decision, bool):
+                raise ValueError("disagreement assessment must return a boolean material_disagreement")
+            material_disagreement = decision
+            materiality_reasons = [str(reason) for reason in assessment.get("reasons", [])]
+            self.router.learn(record, "disagreement_assessment", True,
+                              (time.monotonic() - started) * 1000)
         audit = None
-        if disagreement:
+        if material_disagreement:
             record = self.router.choose(list(self.records.values()), "sister_audit")
             started = time.monotonic()
-            audit = ModelBackedCognition(self.bus, record.provider).ask(
+            audit = ModelBackedCognition(self.bus, record).ask(
                 "Act as a separate sister-audit demand. Identify material disagreements, assess each argument "
                 "against the goal, and return disagreements, synthesis, selected_next_action, and rationale.",
                 {"goal": text, "independent_arguments": interpretations})
             self.router.learn(record, "sister_audit", True, (time.monotonic() - started) * 1000)
         episode = {"id": uuid4().hex, "goal_id": goal_id, "goal": text,
-                   "interpretations": interpretations, "material_disagreement": disagreement,
+                   "interpretations": interpretations,
+                   "candidate_disagreement": candidate_disagreement,
+                   "material_disagreement": material_disagreement,
+                   "materiality_reasons": materiality_reasons,
                    "audit": audit, "assemblies": [{"colony": d.colony_name, "purpose": d.purpose.value,
                                                     "neurons": list(d.neuron_ids)} for d in decisions]}
         state = {"id": goal_id, "description": text, "status": GoalStatus.ACTIVE.value,
@@ -164,10 +186,20 @@ class GodRuntime:
         return name, self.organism.colonies[name]
 
     @staticmethod
-    def _disagree(arguments: dict[str, dict[str, Any]]) -> bool:
+    def _core_claims(arguments: dict[str, dict[str, Any]]) -> list[dict[str, Any]]:
+        return [{"colony": colony,
+                 "hypotheses": view["argument"].get("hypotheses", []),
+                 "next_action": view["argument"].get("next_useful_action"),
+                 "critical_assumptions": view["argument"].get(
+                     "critical_assumptions", view["argument"].get("constraints", []))}
+                for colony, view in arguments.items()]
+
+    @classmethod
+    def _candidate_disagreement(cls, arguments: dict[str, dict[str, Any]]) -> bool:
         if len(arguments) < 2:
             return False
-        normalized = [json.dumps(v["argument"], sort_keys=True) for v in arguments.values()]
+        normalized = [json.dumps({key: value for key, value in claim.items() if key != "colony"},
+                                 sort_keys=True) for claim in cls._core_claims(arguments)]
         return len(set(normalized)) > 1
 
     def _learn_neurons(self, decisions: list[Any], stimulus: str) -> None:
@@ -176,10 +208,8 @@ class GodRuntime:
             for neuron_id in decision.neuron_ids:
                 neuron = colony.neurons[neuron_id]
                 neuron.specialize(decision.purpose.value, stimulus)
-                neuron.verified_contribution += .25
-                neuron.confidence = min(1, neuron.confidence + .02)
-            if len(decision.neuron_ids) > 1:
-                colony.adapt_weight(*decision.neuron_ids[:2], verified=True)
+                # Successful cognition is useful experience, not verified real-world evidence.
+                neuron.confidence = min(1, neuron.confidence + .01)
             colony.memories.append(decision.purpose.value)
 
     def _dissolve(self) -> None:
@@ -209,7 +239,7 @@ class GodRuntime:
         else:
             record = self.router.choose(list(self.records.values()), "conversation")
             persisted = json.loads(active[0]["state"]) if active else None
-            result = ModelBackedCognition(self.bus, record.provider).ask(
+            result = ModelBackedCognition(self.bus, record).ask(
                 "Reply naturally and truthfully. Do not invent activity; use only supplied persisted state.",
                 {"message": message, "active_goal": persisted})
             answer = str(result.get("answer", result.get("response", "I do not have an answer.")))

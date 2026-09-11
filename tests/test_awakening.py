@@ -8,6 +8,7 @@ from tmco.buses import ModelBus, ProviderUnavailable, TestProvider as ProviderFi
 from tmco.models import ModelRecord
 from tmco.morphogenesis import AssemblyFormationPolicy
 from tmco.vault import CredentialVault
+from tmco.web import App
 
 
 class ScriptedOrgan:
@@ -18,6 +19,8 @@ class ScriptedOrgan:
     def infer(self, request: dict) -> dict:
         self.calls.append(request)
         prompt = request["prompt"]
+        if "Assess only whether" in prompt:
+            return {"material_disagreement": True, "reasons": ["actions conflict"]}
         if "separate sister-audit" in prompt:
             return {"disagreements": ["sequence versus experiment"],
                     "synthesis": "Run a bounded experiment, then sequence evidence.",
@@ -55,16 +58,20 @@ def test_full_awakening_audit_learning_and_restart(tmp_path: Path) -> None:
     policy = RecordingPolicy()
     first = runtime(tmp_path, policy)
     identities = {name: colony.id for name, colony in first.organism.colonies.items()}
+    weights = {name: colony.graph() for name, colony in first.organism.colonies.items()}
     episode1 = first.submit_goal("Find a realistic way to reduce water waste")
     assert policy.calls == 1
     assert set(episode1["interpretations"]) == {"Saphira-A", "Saphira-B"}
     assert episode1["material_disagreement"] is True
     assert episode1["audit"]["disagreements"]
     assert episode1["audit"]["rationale"]
-    learned = sum(n.verified_contribution for c in first.organism.colonies.values()
-                  for n in c.neurons.values())
+    assert sum(n.verified_contribution for c in first.organism.colonies.values()
+               for n in c.neurons.values()) == 0
+    assert {name: colony.graph() for name, colony in first.organism.colonies.items()} == weights
+    learned_specializations = sum(n.specialization != "generalist"
+                                  for c in first.organism.colonies.values() for n in c.neurons.values())
     episode2 = first.submit_goal("Find a realistic way to reduce water waste again")
-    assert policy.calls == 2 and learned > 0
+    assert policy.calls == 2 and learned_specializations > 0
     # Compare task 2 with an inexperienced organism: the history, not just task wording,
     # changes the state-sensitive colony/assembly decision.
     control = runtime(tmp_path / "control")
@@ -85,7 +92,7 @@ def test_full_awakening_audit_learning_and_restart(tmp_path: Path) -> None:
     assert len(restored.store.rows("SELECT * FROM episodes")) == 2
     assert any(r.successes for r in restored.records.values())
     assert sum(n.verified_contribution for c in restored.organism.colonies.values()
-               for n in c.neurons.values()) > 0
+               for n in c.neurons.values()) == 0
     assert '"hypotheses": ["A"]' in restored.chat("What does Saphira-A think?")
     restored.close()
     # WAL was explicitly checkpointed and all handles are closed, permitting replacement on Windows.
@@ -116,3 +123,79 @@ def test_credentials_are_separate_encrypted_and_binary_safe(tmp_path: Path) -> N
     for candidate in tmp_path.glob("*"):
         if candidate.is_file() and candidate.name != "credentials.local":
             assert secret.encode() not in candidate.read_bytes()
+
+
+class SameProviderOrgan:
+    def __init__(self, *, cosmetic: bool = False):
+        self.model_ids: list[str] = []
+        self.cosmetic = cosmetic
+
+    def infer(self, request: dict) -> dict:
+        self.model_ids.append(request["model_id"])
+        prompt = request["prompt"]
+        if "Assess only whether" in prompt:
+            return {"material_disagreement": True, "reasons": ["different next actions"]}
+        if "separate sister-audit" in prompt:
+            return {"disagreements": ["action"], "synthesis": "test both", "selected_next_action": "test",
+                    "rationale": "bounded evidence"}
+        action = "same action" if self.cosmetic else f"action from {request['model_id']}"
+        result = {"hypotheses": ["same"] if self.cosmetic else [request["model_id"]],
+                  "constraints": ["same"], "next_useful_action": action}
+        if self.cosmetic: result["wording"] = request["model_id"]
+        return result
+
+
+def test_same_provider_routes_actual_models_and_cosmetic_difference_skips_audit(tmp_path: Path) -> None:
+    organ = SameProviderOrgan(cosmetic=True)
+    organism = GodRuntime(tmp_path, {"shared": organ},
+                          [ModelRecord("shared", "model-one"), ModelRecord("shared", "model-two")],
+                          secret="test-key")
+    episode = organism.submit_goal("Find a realistic way to compare harmless wording")
+    assert set(organ.model_ids) == {"model-one", "model-two"}
+    assert len(organ.model_ids) == 2  # no materiality assessment and no full audit
+    assert episode["candidate_disagreement"] is False
+    assert episode["material_disagreement"] is False
+    assert episode["materiality_reasons"] == [] and episode["audit"] is None
+    organism.close()
+
+
+class ProbeProvider:
+    valid = True
+
+    def __init__(self, endpoint: str, key: str, *, gemini: bool = False):
+        self.key = key
+
+    def infer(self, request: dict) -> dict:
+        if not self.valid: raise RuntimeError("safe failure")
+        if "Capability probe" in request["prompt"]: return {"probe": True}
+        return {"answer": "persist me"}
+
+    def catalog(self) -> list[dict]:
+        return [{"id": "chosen", "context_length": 8192,
+                 "architecture": {"input_modalities": ["text", "image"]},
+                 "pricing": {"prompt": "0.000001", "completion": "0.000002"}}]
+
+
+def test_connection_probe_metadata_and_visible_chat_restart(tmp_path: Path,
+                                                            monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr("tmco.web.HTTPModelProvider", ProbeProvider)
+    values = {"provider": "OpenRouter", "model": "chosen", "endpoint": "https://safe.invalid/chat/completions",
+              "key": "connection-secret"}
+    ProbeProvider.valid = False
+    failed = App(tmp_path)
+    with pytest.raises(RuntimeError): failed.connect(values)
+    assert failed.runtime is None and not (tmp_path / "credentials.vault").exists()
+
+    ProbeProvider.valid = True
+    assert failed.connect(values).startswith("Connected")
+    record = next(iter(failed.runtime.records.values()))
+    assert record.context_capability == 8192 and record.modalities == ["text", "image"]
+    assert record.input_cost == .000001 and record.output_cost == .000002
+    assert "Intelligence CONNECTED" in failed.status()
+    assert failed.chat("hello") == "persist me"
+    failed.close()
+
+    restored = App(tmp_path)
+    assert "Pier: hello" in restored.transcript and "G.O.D.: persist me" in restored.transcript
+    assert "Saphira-A ONLINE" in restored.status() and "Root SECURE" in restored.status()
+    restored.close()

@@ -31,20 +31,27 @@ class ModelRecord:
 
 
 class HTTPModelProvider:
-    def __init__(self, endpoint: str, api_key: str, model_id: str, *, gemini: bool = False):
-        self.endpoint, self.api_key, self.model_id, self.gemini = endpoint, api_key, model_id, gemini
+    """One provider connection capable of serving multiple routed model records."""
+
+    def __init__(self, endpoint: str, api_key: str, *, gemini: bool = False):
+        self.endpoint, self.api_key, self.gemini = endpoint.rstrip("/"), api_key, gemini
 
     def infer(self, request: dict[str, Any]) -> dict[str, Any]:
         prompt = request.get("prompt", "")
+        model_id = request.get("model_id")
+        if not isinstance(model_id, str) or not model_id:
+            raise ValueError("model_id is required for every model request")
         if self.gemini:
             body = {"contents": [{"parts": [{"text": prompt}]}],
                     "generationConfig": {"responseMimeType": "application/json"}}
             headers = {"Content-Type": "application/json", "x-goog-api-key": self.api_key}
+            endpoint = f"{self.endpoint}/models/{model_id}:generateContent"
         else:
-            body = {"model": self.model_id, "messages": [{"role": "user", "content": prompt}],
+            body = {"model": model_id, "messages": [{"role": "user", "content": prompt}],
                     "response_format": {"type": "json_object"}}
             headers = {"Content-Type": "application/json", "Authorization": f"Bearer {self.api_key}"}
-        call = urllib.request.Request(self.endpoint, json.dumps(body).encode(), headers=headers)
+            endpoint = self.endpoint
+        call = urllib.request.Request(endpoint, json.dumps(body).encode(), headers=headers)
         try:
             with urllib.request.urlopen(call, timeout=60) as response:
                 payload = json.load(response)
@@ -59,7 +66,7 @@ class HTTPModelProvider:
 
     def catalog(self) -> list[dict[str, Any]]:
         if self.gemini:
-            url = "https://generativelanguage.googleapis.com/v1beta/models"
+            url = f"{self.endpoint}/models"
             headers = {"x-goog-api-key": self.api_key}
         else:
             url = self.endpoint.rsplit("/chat/completions", 1)[0] + "/models"
