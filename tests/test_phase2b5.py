@@ -178,6 +178,53 @@ def test_action_events_follow_persisted_transition_and_approval_order(tmp_path: 
     store.close()
 
 
+def test_worker_links_approval_to_only_the_originating_job(tmp_path: Path, monkeypatch) -> None:
+    class Runtime:
+        pending = None
+        def operational_status(self): return {"pending_approval": self.pending}
+    class ApprovalApp:
+        def __init__(self, data): self.runtime, self.transcript = Runtime(), []
+        def chat(self, message):
+            if message == "needs approval": self.runtime.pending = {"id": "approval-1"}
+            return message
+        def decide_approval(self, request_id, approved):
+            assert request_id == "approval-1"; self.runtime.pending = None
+        def close(self): pass
+    monkeypatch.setattr("tmco.web.App", ApprovalApp)
+    worker = RuntimeWorker(tmp_path)
+    unrelated, unrelated_reply = worker.submit("chat", "ordinary")
+    assert unrelated_reply.get(timeout=2)[0]
+    origin, origin_reply = worker.submit("chat", "needs approval")
+    assert origin_reply.get(timeout=2)[0]
+    states = worker.snapshot_jobs()
+    assert states[origin]["state"] == "WAITING_FOR_APPROVAL"
+    assert states[origin]["approval_request_id"] == "approval-1"
+    prior_unrelated = states[unrelated].copy()
+    worker.call("decide_approval", "approval-1", True)
+    states = worker.snapshot_jobs()
+    assert states[origin]["state"] == "COMPLETE" and states[origin]["approval_request_id"] is None
+    assert states[unrelated] == prior_unrelated
+    worker.close()
+
+
+def test_worker_denial_clears_waiting_job(tmp_path: Path, monkeypatch) -> None:
+    class Runtime:
+        pending = {"id": "approval-deny"}
+        def operational_status(self): return {"pending_approval": self.pending}
+    class ApprovalApp:
+        def __init__(self, data): self.runtime, self.transcript = Runtime(), []
+        def chat(self, message): return "waiting"
+        def decide_approval(self, request_id, approved): self.runtime.pending = None
+        def close(self): pass
+    monkeypatch.setattr("tmco.web.App", ApprovalApp)
+    worker = RuntimeWorker(tmp_path); origin, reply = worker.submit("chat", "request")
+    assert reply.get(timeout=2)[0] and worker.snapshot_jobs()[origin]["state"] == "WAITING_FOR_APPROVAL"
+    worker.call("decide_approval", "approval-deny", False)
+    assert worker.snapshot_jobs()[origin]["state"] == "COMPLETE"
+    assert "blocked" in worker.snapshot_jobs()[origin]["result"]
+    worker.close()
+
+
 class BootstrapConnector:
     def __init__(self, name, valid=True): self.name, self.valid = name, valid
     def discover(self):

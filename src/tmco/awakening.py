@@ -678,6 +678,8 @@ class GodRuntime:
             state.update(status="awaiting_outcome", current_step="AWAITING_OUTCOME", current_organ=request["organ"],
                          last_observation=result.action_id, pending_approval=None)
             self.store.put("goals", state["id"], state)
+            self._event("OUTCOME_AWAITING", "Approved body result awaits outcome evidence",
+                        {"goal_id": state["id"], "action_id": result.action_id})
 
     def chat(self, message: str) -> str:
         self.store.chat("user", message)
