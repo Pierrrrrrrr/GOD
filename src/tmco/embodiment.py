@@ -318,6 +318,7 @@ class ActionLoop:
             request = HumanApprovalRequest(uuid4().hex, demand.goal_id, organ.id, operation, permission,
                 "side effect requires Pier approval", scope, demand.risk, organ.cost, organ.side_effect_class,
                 organ.reversible, demand.inputs)
+            self.store.put("pending_demand", request.id, {**asdict(demand), "approval_request_id": request.id})
             self.store.put("approval", request.id, request); return request
         action_id = uuid4().hex
         prediction = Prediction(action_id, demand.goal_id, demand.expected_output, demand.expected_evidence,

@@ -4,7 +4,8 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 
 from tmco.awakening import GodRuntime
-from tmco.embodiment import OutcomeEvaluation
+from tmco.buses import OrganManifest
+from tmco.embodiment import HumanApprovalRequest, OutcomeEvaluation
 from tmco.models import ModelRecord
 from tmco.sisters import DigestResponse
 import time
@@ -23,6 +24,12 @@ class BodyPlanningProvider:
             demands = [
               {"required_capability":"filesystem","intent":"read","inputs":{"path":"source.txt"},"expected_output":"text","expected_evidence":"file text","risk":0,"side_effect_class":"none","budget":1,"reversibility":True,"confidence":.9,"goal_value":2,"information_gain":.8,"capability_gain":0,"uncertainty":.1,"network_need":"none","filesystem_need":"workspace"},
               {"required_capability":"filesystem","intent":"write","inputs":{"path":"source.summary.txt","content":"Summary: {evidence}"},"expected_output":"summary file","expected_evidence":"file hash","risk":0,"side_effect_class":"workspace","budget":1,"reversibility":True,"confidence":.9,"goal_value":3,"information_gain":0,"capability_gain":0,"uncertainty":.1,"network_need":"none","filesystem_need":"workspace"}]
+        elif "approval" in goal.lower():
+            demands=[{"required_capability":"mutation","intent":"mutate","inputs":{"value":"original"},
+              "expected_output":"mutated result","expected_evidence":"controlled receipt","risk":.8,
+              "side_effect_class":"external-mutation","budget":2,"reversibility":False,"confidence":.73,
+              "goal_value":4.2,"information_gain":.31,"capability_gain":.12,"uncertainty":.27,
+              "network_need":"controlled","filesystem_need":"none"}]
         else:
             demands = [
               {"required_capability":"web","intent":"GET","inputs":{"url":self.url},"expected_output":"official evidence","expected_evidence":"HTTP hash","risk":0,"side_effect_class":"none","budget":1,"reversibility":True,"confidence":.8,"goal_value":2,"information_gain":2,"capability_gain":0,"uncertainty":.2,"network_need":"public-http-test","filesystem_need":"none"},
@@ -116,3 +123,34 @@ def test_redirect_target_is_revalidated():
         except PermissionDenied: pass
         else: raise AssertionError("metadata redirect target was accepted")
     finally: server.shutdown(); worker.join(); server.server_close()
+
+
+def test_approval_resumes_exact_demand_and_deny_never_fakes_action(tmp_path: Path):
+    provider=BodyPlanningProvider("unused"); runtime=GodRuntime(tmp_path,{"p":provider},[ModelRecord("p","A"),ModelRecord("p","B")],secret="key")
+    effects=[]
+    manifest=OrganManifest("controlled-mutator","openapi","1",{"mutate":{"required":["value"]}},
+        permissions={"controlled.mutate"},risk=.5,side_effect_class="external-mutation",reversible=False,
+        capability_tags={"mutation"},network_scope=("controlled",))
+    runtime.organ_registry.register(manifest,{"mutate":lambda inputs: effects.append(dict(inputs)) or {"receipt":"ok"}})
+    episode=runtime.submit_goal("Approval required for controlled mutation")
+    assert episode["body"]["status"]=="pending_approval" and not effects
+    request=runtime.operational_status()["pending_approval"]; pending=runtime.embodiment_store.all("pending_demand")[-1]
+    original={key:pending[key] for key in ("id","decision_provenance_id","expected_output","expected_evidence","confidence","goal_value","information_gain","capability_gain","uncertainty","risk","budget","network_need","filesystem_need","reversible","inputs")}
+    before=sum(n.verified_contribution for c in runtime.organism.colonies.values() for n in c.neurons.values())
+    runtime.decide_approval(request["id"],True)
+    assert effects==[{"value":"original"}]
+    observation=runtime.embodiment_store.all("observation")[-1]; prediction=runtime.embodiment_store.all("prediction")[-1]
+    assert observation["decision_provenance_id"]==original["decision_provenance_id"]
+    assert prediction["decision_provenance_id"]==original["decision_provenance_id"]
+    assert (prediction["expected"],prediction["expected_evidence"],prediction["confidence"],prediction["expected_value"],prediction["information_gain"],prediction["capability_gain"],prediction["uncertainty"]) == ("mutated result","controlled receipt",.73,4.2,.31,.12,.27)
+    assert runtime.operational_status()["current_step"]=="AWAITING_OUTCOME"
+    assert sum(n.verified_contribution for c in runtime.organism.colonies.values() for n in c.neurons.values())==before
+    assert runtime.evaluate_outcome(OutcomeEvaluation(observation["action_id"],"OBJECTIVE_TEST",("receipt:1",),True,"pass",time.time(),"controlled receipt"))
+    assert runtime.operational_status()["current_step"]=="OUTCOME_VERIFIED"
+    assert sum(n.verified_contribution for c in runtime.organism.colonies.values() for n in c.neurons.values())>before
+
+    second=runtime.submit_goal("Approval required for controlled mutation again"); denied=runtime.operational_status()["pending_approval"]
+    count=len(runtime.embodiment_store.all("observation")); runtime.decide_approval(denied["id"],False)
+    assert len(runtime.embodiment_store.all("observation"))==count and len(effects)==1
+    assert runtime.operational_status()["current_step"]=="DENIED"
+    runtime.close()

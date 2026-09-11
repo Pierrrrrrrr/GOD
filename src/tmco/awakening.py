@@ -490,22 +490,28 @@ class GodRuntime:
 
     def decide_approval(self, request_id: str, approve: bool) -> None:
         if not approve:
-            self.permission_authority.deny(request_id, approver="Pier"); return
+            self.permission_authority.deny(request_id, approver="Pier")
+            request = next(a for a in self.embodiment_store.all("approval") if a["id"] == request_id)
+            goal_rows = self.store.rows("SELECT state FROM goals WHERE id=?", (request["goal_id"],))
+            if goal_rows:
+                state = json.loads(goal_rows[0]["state"])
+                state.update(status="blocked", current_step="DENIED", pending_approval=None)
+                self.store.put("goals", state["id"], state)
+            return
         lease = self.permission_authority.approve(request_id, approver="Pier")
         request = next(a for a in self.embodiment_store.all("approval") if a["id"] == request_id)
+        pending = next(d for d in self.embodiment_store.all("pending_demand")
+                       if d["approval_request_id"] == request_id)
+        pending.pop("approval_request_id")
+        demand = CapabilityDemand(**pending)
         manifest = self.body_bus.manifests[request["organ"]]
-        capability = next(iter(manifest.capability_tags))
         goal_rows = self.store.rows("SELECT state FROM goals WHERE id=?", (request["goal_id"],))
         state = json.loads(goal_rows[0]["state"]) if goal_rows else {"id":request["goal_id"],"description":"approved task"}
-        demand = CapabilityDemand(request["goal_id"], state["description"], capability, request["operation"],
-                                  request["inputs"], "approved result", request["risk"], request["side_effect_class"],
-                                  request["scope"] if manifest.kind in {"web","openapi"} else "none",
-                                  request["scope"] if manifest.kind == "filesystem" else "none", budget=max(request["cost"], .000001),
-                                  reversible=request["reversible"])
         result = self.action_loop.execute(demand, lease=lease)
         if isinstance(result, ObservationEnvelope):
-            self.action_loop.verify(result, lambda observation: observation.success and bool(observation.content_hash))
-            state.update(status="verified", current_step="complete", current_organ=request["organ"],
+            level = VerificationLevel.TRANSPORT_VERIFIED if manifest.kind == "web" else VerificationLevel.ARTIFACT_VERIFIED
+            self.action_loop.verify(result, lambda observation: observation.success and bool(observation.content_hash), level)
+            state.update(status="awaiting_outcome", current_step="AWAITING_OUTCOME", current_organ=request["organ"],
                          last_observation=result.action_id, pending_approval=None)
             self.store.put("goals", state["id"], state)
 
