@@ -6,13 +6,14 @@ import html
 import json
 import sqlite3
 import threading
+import time
 import webbrowser
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs
 
 from .awakening import GodRuntime
-from .models import HTTPModelProvider, ModelRecord
+from .models import HTTPModelProvider, ModelRecord, ModelRouter
 from .vault import CredentialVault
 
 
@@ -32,12 +33,14 @@ input[name=message]{width:70%}#chat{white-space:pre-wrap;background:#171c26;padd
 
 class App:
     def __init__(self, data: Path):
-        self.data, self.vault, self.runtime = data, CredentialVault(data), None
+        self.data, self.vault = data, CredentialVault(data)
+        # The organism is primary and always boots; intelligence is an attachable organ.
+        self.runtime = GodRuntime(data)
         self.transcript: list[str] = []
         credentials = self.vault.load()
         if credentials:
             try: self._connect(credentials)
-            except Exception: self.runtime = None
+            except Exception: pass
         self._load_transcript()
 
     def _connect(self, values: dict[str, str]) -> None:
@@ -50,11 +53,12 @@ class App:
             endpoint = values.get("endpoint") or "https://openrouter.ai/api/v1/chat/completions"
             organ = HTTPModelProvider(endpoint, key)
             name = "openrouter" if provider == "OpenRouter" else "compatible"
+        started = time.monotonic()
         probe = organ.infer({"model_id": model,
                              "prompt": "Capability probe. Return only JSON: {\"probe\": true}"})
+        probe_latency = (time.monotonic() - started) * 1000
         if probe.get("probe") is not True:
             raise RuntimeError("provider capability probe failed")
-        if self.runtime: self.runtime.close()
         record = ModelRecord(name, model)
         catalog = organ.catalog()
         metadata = next((item for item in catalog if item.get("id", item.get("name", "")).endswith(model)), None)
@@ -65,7 +69,10 @@ class App:
             pricing = metadata.get("pricing", {})
             record.input_cost = self._price(pricing.get("prompt"))
             record.output_cost = self._price(pricing.get("completion"))
-        self.runtime = GodRuntime(self.data, {name: organ}, [record])
+        self.runtime.attach_intelligence({name: organ}, [record])
+        attached = self.runtime.records[record.key]
+        ModelRouter.observe_call(attached, True, probe_latency)
+        self.runtime._save_models()
 
     def connect(self, values: dict[str, str]) -> str:
         self._connect(values)
@@ -89,26 +96,23 @@ class App:
         finally: connection.close()
 
     def status(self) -> str:
-        intelligence = "CONNECTED" if self.runtime else "DISCONNECTED"
-        healthy = (self.runtime is not None
-                   and set(self.runtime.organism.colonies) == {"Saphira-A", "Saphira-B"}
+        intelligence = "CONNECTED" if self.runtime.intelligence_connected else "DISCONNECTED"
+        healthy = (set(self.runtime.organism.colonies) == {"Saphira-A", "Saphira-B"}
                    and self.runtime.organism.root.verify_audit())
         lines = ["Saphira-A ONLINE", "Saphira-B ONLINE", "Root SECURE",
                  f"Intelligence {intelligence}"] if healthy else [
                      "Saphira-A OFFLINE", "Saphira-B OFFLINE", "Root NOT INITIALIZED",
                      f"Intelligence {intelligence}"]
-        if self.runtime:
-            active = self.runtime.store.rows(
-                "SELECT description FROM goals WHERE status='active' ORDER BY rowid DESC LIMIT 1")
-            if active: lines.append(f"Active goal: {active[0]['description']}")
+        active = self.runtime.store.rows(
+            "SELECT description FROM goals WHERE status='active' ORDER BY rowid DESC LIMIT 1")
+        if active: lines.append(f"Active goal: {active[0]['description']}")
         return "<br>".join(html.escape(line) for line in lines)
 
     def chat(self, message: str) -> str:
-        if not self.runtime: return "Connect a model provider first."
         return self.runtime.chat(message)
 
     def close(self) -> None:
-        if self.runtime: self.runtime.close()
+        self.runtime.close()
 
 
 def serve(data: Path, port: int, *, open_browser: bool = True) -> None:

@@ -80,7 +80,10 @@ def test_full_awakening_audit_learning_and_restart(tmp_path: Path) -> None:
     assert assignment(episode2) != assignment(control_episode)
     control.close()
     assert any(r.successes for r in first.records.values())
+    assert all(not r.task_performance and r.calibration == .5 and r.quality_observations == 0
+               for r in first.records.values())
     assert "Hello Pier" in first.chat("Hello")
+    assert "No real-world outcome has been verified" in first.chat("What have you learned?")
     calls_after_chat = sum(len(p.calls) for p in first.bus.providers.values())
     assert calls_after_chat >= 6  # independent calls, audits, then one ordinary conversation call
     first.close()
@@ -88,7 +91,7 @@ def test_full_awakening_audit_learning_and_restart(tmp_path: Path) -> None:
     restored = runtime(tmp_path)
     assert {name: colony.id for name, colony in restored.organism.colonies.items()} == identities
     assert len(restored.store.rows("SELECT * FROM goals")) == 2
-    assert len(restored.store.rows("SELECT * FROM chat")) == 2
+    assert len(restored.store.rows("SELECT * FROM chat")) == 4
     assert len(restored.store.rows("SELECT * FROM episodes")) == 2
     assert any(r.successes for r in restored.records.values())
     assert sum(n.verified_contribution for c in restored.organism.colonies.values()
@@ -183,11 +186,21 @@ def test_connection_probe_metadata_and_visible_chat_restart(tmp_path: Path,
               "key": "connection-secret"}
     ProbeProvider.valid = False
     failed = App(tmp_path)
+    identities = {name: colony.id for name, colony in failed.runtime.organism.colonies.items()}
+    assert "Saphira-A ONLINE" in failed.status() and "Root SECURE" in failed.status()
+    assert "Intelligence DISCONNECTED" in failed.status()
+    assert failed.runtime.organism.memory is not None
+    with pytest.raises(ProviderUnavailable, match="disconnected"):
+        failed.runtime.submit_goal("reason without an organ")
+    with pytest.raises(ProviderUnavailable, match="disconnected"):
+        failed.chat("try to reason")
+    assert not failed.runtime.store.rows("SELECT * FROM episodes")
     with pytest.raises(RuntimeError): failed.connect(values)
-    assert failed.runtime is None and not (tmp_path / "credentials.vault").exists()
+    assert not failed.runtime.intelligence_connected and not (tmp_path / "credentials.vault").exists()
 
     ProbeProvider.valid = True
     assert failed.connect(values).startswith("Connected")
+    assert {name: colony.id for name, colony in failed.runtime.organism.colonies.items()} == identities
     record = next(iter(failed.runtime.records.values()))
     assert record.context_capability == 8192 and record.modalities == ["text", "image"]
     assert record.input_cost == .000001 and record.output_cost == .000002
@@ -195,7 +208,30 @@ def test_connection_probe_metadata_and_visible_chat_restart(tmp_path: Path,
     assert failed.chat("hello") == "persist me"
     failed.close()
 
+    ProbeProvider.valid = False
     restored = App(tmp_path)
-    assert "Pier: hello" in restored.transcript and "G.O.D.: persist me" in restored.transcript
+    assert {name: colony.id for name, colony in restored.runtime.organism.colonies.items()} == identities
     assert "Saphira-A ONLINE" in restored.status() and "Root SECURE" in restored.status()
+    assert "Intelligence DISCONNECTED" in restored.status()
+    assert "Pier: hello" in restored.transcript and "G.O.D.: persist me" in restored.transcript
+    with pytest.raises(ProviderUnavailable, match="disconnected"):
+        restored.runtime.submit_goal("still cannot reason")
+
+    ProbeProvider.valid = True
+    assert restored.connect(values).startswith("Connected")
+    assert {name: colony.id for name, colony in restored.runtime.organism.colonies.items()} == identities
+    assert "Intelligence CONNECTED" in restored.status()
     restored.close()
+
+
+def test_verified_quality_requires_explicit_outcome() -> None:
+    from tmco.models import ModelRouter
+
+    record = ModelRecord("provider", "model")
+    ModelRouter.observe_call(record, True, 12)
+    assert record.successes == 1 and record.availability
+    assert record.task_performance == {} and record.calibration == .5
+    assert record.quality_observations == 0
+    ModelRouter.observe_verified_outcome(record, "planning", True)
+    assert record.task_performance["planning"] > .5
+    assert record.calibration == 1 and record.quality_observations == 1

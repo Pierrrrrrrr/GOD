@@ -23,6 +23,7 @@ class ModelRecord:
     failures: int = 0
     task_performance: dict[str, float] = field(default_factory=dict)
     calibration: float = .5
+    quality_observations: int = 0
     last_tested: float | None = None
 
     @property
@@ -99,11 +100,19 @@ class ModelRouter:
         return max(candidates, key=score)
 
     @staticmethod
-    def learn(record: ModelRecord, task: str, success: bool, latency_ms: float) -> None:
+    def observe_call(record: ModelRecord, success: bool, latency_ms: float) -> None:
+        """Record transport/schema health, never cognitive correctness."""
         record.last_tested = time.time()
         record.latency_ms = latency_ms if not record.latency_ms else .7 * record.latency_ms + .3 * latency_ms
         record.successes += int(success)
         record.failures += int(not success)
+        record.availability = success
+
+    @staticmethod
+    def observe_verified_outcome(record: ModelRecord, task: str, correct: bool) -> None:
+        """Update quality only when an explicit later evaluation supplies ground truth."""
         prior = record.task_performance.get(task, .5)
-        record.task_performance[task] = .8 * prior + .2 * float(success)
-        record.calibration = record.successes / max(1, record.successes + record.failures)
+        record.task_performance[task] = .8 * prior + .2 * float(correct)
+        total = record.quality_observations
+        record.calibration = (record.calibration * total + float(correct)) / (total + 1)
+        record.quality_observations += 1

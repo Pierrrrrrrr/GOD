@@ -9,7 +9,7 @@ from pathlib import Path
 from typing import Any
 from uuid import uuid4
 
-from .buses import ModelBus, ModelProvider
+from .buses import ModelBus, ModelProvider, ProviderUnavailable
 from .executive import Cognition
 from .models import ModelRecord, ModelRouter
 from .morphogenesis import AssemblyFormationPolicy
@@ -84,29 +84,68 @@ class ModelBackedCognition(Cognition):
                              {"goal": goal.description, "evidence": observation}).get("verified"))
 
 
+class DisconnectedCognition(Cognition):
+    """Safe core boundary: Saphira exists, but no external reasoning is available."""
+
+    @staticmethod
+    def _unavailable() -> None:
+        raise ProviderUnavailable("external intelligence is disconnected")
+
+    def decompose(self, goal: Goal) -> list[str]:
+        self._unavailable()
+
+    def candidates(self, goal: Goal) -> list[ActionCandidate]:
+        self._unavailable()
+
+    def verify(self, goal: Goal, observation: str) -> bool:
+        self._unavailable()
+
+
 class GodRuntime:
     """Phase 2 runtime. Calls only ModelBackedCognition through a production ModelBus."""
-    def __init__(self, directory: Path, providers: dict[str, ModelProvider],
-                 records: list[ModelRecord], *, formation_policy: AssemblyFormationPolicy | None = None,
+    def __init__(self, directory: Path, providers: dict[str, ModelProvider] | None = None,
+                 records: list[ModelRecord] | None = None, *, formation_policy: AssemblyFormationPolicy | None = None,
                  secret: bytes | str | None = None):
         self.directory = directory
-        self.bus = ModelBus(providers, production=True)
+        self.bus = ModelBus(production=True)
         self.router = ModelRouter()
-        self.records = {record.key: record for record in records}
-        if not self.records:
-            raise RuntimeError("at least one model record is required")
-        initial = self.router.choose(list(self.records.values()), "conversation")
-        self.cognition = ModelBackedCognition(self.bus, initial)
+        self.records: dict[str, ModelRecord] = {}
+        self.cognition: Cognition = DisconnectedCognition()
         self.policy = formation_policy or AssemblyFormationPolicy()
         # Existing Phase 1 state format remains the authority for organism identity/neural state.
         self.organism = TMCOSystem(directory / "organism", self.cognition, secret=secret,
                                    formation_policy=self.policy)
         self.store = AwakeningStore(directory / "awakening.sqlite3")
+        if providers or records:
+            self.attach_intelligence(providers or {}, records or [])
+
+    @property
+    def intelligence_connected(self) -> bool:
+        return bool(self.bus.providers and self.records)
+
+    def attach_intelligence(self, providers: dict[str, ModelProvider],
+                            records: list[ModelRecord]) -> None:
+        bus = ModelBus(providers, production=True)
+        configured = {record.key: record for record in records}
+        if not configured:
+            raise ProviderUnavailable("at least one model record is required")
+        self.bus, self.records = bus, configured
         self._restore_models()
+        # Attachment follows a successful capability probe, so transient prior
+        # unavailability must not prevent this newly confirmed connection.
+        for key, record in configured.items():
+            self.records[key].availability = record.availability
+        initial = self.router.choose(list(self.records.values()), "conversation")
+        self.cognition = ModelBackedCognition(self.bus, initial)
+        self.organism.executive.cognition = self.cognition
+        self._save_models()
 
     def _restore_models(self) -> None:
         for row in self.store.rows("SELECT state FROM models"):
             data = json.loads(row["state"])
+            if "quality_observations" not in data:
+                # Pre-correction values conflated call success with quality and cannot be trusted.
+                data["task_performance"], data["calibration"] = {}, .5
             record = ModelRecord(**data)
             if record.key in self.records:
                 self.records[record.key] = record
@@ -114,6 +153,8 @@ class GodRuntime:
     def submit_goal(self, text: str, *, important: bool = True) -> dict[str, Any]:
         if not text.strip():
             raise ValueError("a natural-language goal is required")
+        if not self.intelligence_connected:
+            raise ProviderUnavailable("external intelligence is disconnected")
         goal_id = uuid4().hex
         goal = Goal(goal_id, text, ("credible evidence of progress",))
         decisions = self.policy.form(self.organism.colonies, goal,
@@ -131,9 +172,9 @@ class GodRuntime:
                     "Reason independently as this persistent colony. Infer desired_outcome, success_evidence, "
                     "constraints, unknowns, risks, subgoals, hypotheses, and next_useful_action. Do not assume "
                     "the other colony's view.", {"colony": name, "identity": colony.id, "goal": text})
-                self.router.learn(record, "goal_reasoning", True, (time.monotonic() - started) * 1000)
+                self.router.observe_call(record, True, (time.monotonic() - started) * 1000)
             except Exception:
-                self.router.learn(record, "goal_reasoning", False, (time.monotonic() - started) * 1000)
+                self.router.observe_call(record, False, (time.monotonic() - started) * 1000)
                 self._save_models(); raise
             interpretations[name] = {"model": record.key, "argument": answer}
         candidate_disagreement = self._candidate_disagreement(interpretations)
@@ -151,8 +192,7 @@ class GodRuntime:
                 raise ValueError("disagreement assessment must return a boolean material_disagreement")
             material_disagreement = decision
             materiality_reasons = [str(reason) for reason in assessment.get("reasons", [])]
-            self.router.learn(record, "disagreement_assessment", True,
-                              (time.monotonic() - started) * 1000)
+            self.router.observe_call(record, True, (time.monotonic() - started) * 1000)
         audit = None
         if material_disagreement:
             record = self.router.choose(list(self.records.values()), "sister_audit")
@@ -161,7 +201,7 @@ class GodRuntime:
                 "Act as a separate sister-audit demand. Identify material disagreements, assess each argument "
                 "against the goal, and return disagreements, synthesis, selected_next_action, and rationale.",
                 {"goal": text, "independent_arguments": interpretations})
-            self.router.learn(record, "sister_audit", True, (time.monotonic() - started) * 1000)
+            self.router.observe_call(record, True, (time.monotonic() - started) * 1000)
         episode = {"id": uuid4().hex, "goal_id": goal_id, "goal": text,
                    "interpretations": interpretations,
                    "candidate_disagreement": candidate_disagreement,
@@ -237,6 +277,8 @@ class GodRuntime:
                        "what does saphira-a think?", "what does saphira-b think?"}:
             answer = self._state_answer(lower, active)
         else:
+            if not self.intelligence_connected:
+                raise ProviderUnavailable("external intelligence is disconnected")
             record = self.router.choose(list(self.records.values()), "conversation")
             persisted = json.loads(active[0]["state"]) if active else None
             result = ModelBackedCognition(self.bus, record).ask(
@@ -258,7 +300,8 @@ class GodRuntime:
         if question == "why?":
             return str((episode.get("audit") or {}).get("rationale", "The next action follows the recorded reasoning."))
         if "learned" in question:
-            return f"Recorded {len(episode['assemblies'])} assemblies and their verified contributions."
+            return (f"Recruited {len(episode['assemblies'])} assemblies, updated cautious "
+                    "specializations, and recorded routing reliability. No real-world outcome has been verified.")
         return f"Working on {state['description']}. Next action: {state['next_action']}"
 
     def close(self) -> None:
