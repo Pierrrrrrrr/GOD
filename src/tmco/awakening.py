@@ -9,12 +9,17 @@ from pathlib import Path
 from typing import Any
 from uuid import uuid4
 
-from .buses import ModelBus, ModelProvider, ProviderUnavailable
+from .buses import BodyBus, ModelBus, ModelProvider, OrganManifest, ProviderUnavailable
+from .embodiment import (ActionLoop, CapabilityDemand, CapabilityResolver, EmbodimentStore,
+                         HumanApprovalRequest, ObservationEnvelope, OrganRegistry,
+                         PermissionAuthority, WebResearchOrgan, WorkspaceFilesystemOrgan)
 from .executive import Cognition
 from .models import ModelRecord, ModelRouter
 from .morphogenesis import AssemblyFormationPolicy
 from .system import TMCOSystem
 from .types import ActionCandidate, ComputeBudget, Goal, GoalStatus
+from .sisters import (BriefResponse, DigestResponse, SisterBrief, SisterDevelopmentDigest,
+                      SisterExchangePolicy, SisterView, WorkClass, classify_work)
 
 
 class AwakeningStore:
@@ -105,7 +110,7 @@ class GodRuntime:
     """Phase 2 runtime. Calls only ModelBackedCognition through a production ModelBus."""
     def __init__(self, directory: Path, providers: dict[str, ModelProvider] | None = None,
                  records: list[ModelRecord] | None = None, *, formation_policy: AssemblyFormationPolicy | None = None,
-                 secret: bytes | str | None = None):
+                 secret: bytes | str | None = None, web_test_allow_hosts: set[str] | None = None):
         self.directory = directory
         self.bus = ModelBus(production=True)
         self.router = ModelRouter()
@@ -117,8 +122,35 @@ class GodRuntime:
         self.organism = TMCOSystem(directory / "organism", self.cognition, secret=secret,
                                    formation_policy=self.policy)
         self.store = AwakeningStore(directory / "awakening.sqlite3")
+        self.body_bus = BodyBus()
+        self.embodiment_store = EmbodimentStore(directory / "embodiment.sqlite3")
+        self.organ_registry = OrganRegistry(self.body_bus, self.embodiment_store)
+        self.capability_resolver = CapabilityResolver(self.body_bus, self.embodiment_store)
+        self.action_loop = ActionLoop(self.body_bus, self.embodiment_store)
+        self.permission_authority = PermissionAuthority(self.embodiment_store)
+        self.sister_exchange = SisterExchangePolicy()
+        self._restore_exchange_rounds()
+        self._register_builtin_organs(web_test_allow_hosts)
         if providers or records:
             self.attach_intelligence(providers or {}, records or [])
+
+    def _register_builtin_organs(self, test_hosts: set[str] | None) -> None:
+        workspace = self.directory / "workspace"
+        filesystem = WorkspaceFilesystemOrgan(workspace, (self.directory / "organism", self.directory / "credentials.vault"))
+        fs_manifest = OrganManifest("workspace", "filesystem", "1", filesystem.OPERATIONS,
+            description="runtime workspace", permissions={"workspace.access"}, side_effect_class="workspace",
+            capability_tags={"filesystem"}, filesystem_scope=(str(workspace.resolve()),), verified_reliability=1)
+        self.organ_registry.register(fs_manifest, {name: (lambda args, name=name: filesystem.handle(name, args)) for name in filesystem.OPERATIONS})
+        web = WebResearchOrgan(test_allow_hosts=test_hosts)
+        web_manifest = OrganManifest("web-research", "web", "1", {"GET":{"required":["url"]}, "HEAD":{"required":["url"]}},
+            description="public read-only research", permissions={"public.read"}, side_effect_class="read",
+            capability_tags={"web"}, network_scope=("public-http-test" if test_hosts else "public-https",), verified_reliability=.8)
+        self.organ_registry.register(web_manifest, {method: (lambda args, method=method: web.request({**args, "method": method})) for method in ("GET", "HEAD")})
+
+    def _restore_exchange_rounds(self) -> None:
+        for event in self.embodiment_store.all("exchange"):
+            self.sister_exchange.rounds[event["goal_id"]] = max(
+                self.sister_exchange.rounds.get(event["goal_id"], 0), event["round"])
 
     @property
     def intelligence_connected(self) -> bool:
@@ -170,11 +202,13 @@ class GodRuntime:
             raise ProviderUnavailable("external intelligence is disconnected")
         goal_id = uuid4().hex
         goal = Goal(goal_id, text, ("credible evidence of progress",))
+        work_class = classify_work(text)
         decisions = self.policy.form(self.organism.colonies, goal,
                                      {name: ComputeBudget(8) for name in self.organism.colonies})
         interpretations: dict[str, dict[str, Any]] = {}
         used: set[str] = set()
-        colonies = list(self.organism.colonies.items()) if important else [self._best_colony(decisions)]
+        colonies = (list(self.organism.colonies.items()) if work_class == WorkClass.DELIBERATIVE and important
+                    else [self._dynamic_primary(text)])
         for name, colony in colonies:
             record = self.router.choose(list(self.records.values()), "goal_reasoning", exclude=used,
                                         policy=self.routing_policy)
@@ -218,24 +252,122 @@ class GodRuntime:
                 "against the goal, and return disagreements, synthesis, selected_next_action, and rationale.",
                 {"goal": text, "independent_arguments": interpretations})
             self.router.observe_call(record, True, (time.monotonic() - started) * 1000)
+        exchange = self._integrated_exchange(goal_id, interpretations, material_disagreement)
         episode = {"id": uuid4().hex, "goal_id": goal_id, "goal": text,
                    "interpretations": interpretations,
                    "candidate_disagreement": candidate_disagreement,
                    "material_disagreement": material_disagreement,
                    "materiality_reasons": materiality_reasons,
-                   "audit": audit, "assemblies": [{"colony": d.colony_name, "purpose": d.purpose.value,
+                   "audit": audit, "exchange": exchange, "work_class": work_class.value,
+                   "assemblies": [{"colony": d.colony_name, "purpose": d.purpose.value,
                                                     "neurons": list(d.neuron_ids)} for d in decisions]}
         state = {"id": goal_id, "description": text, "status": GoalStatus.ACTIVE.value,
                  "next_action": (audit or next(iter(interpretations.values()))["argument"]).get(
                      "selected_next_action", next(iter(interpretations.values()))["argument"].get("next_useful_action")),
-                 "episode_id": episode["id"]}
+                 "episode_id": episode["id"], "work_class": work_class.value, "current_step": "reasoning",
+                 "current_organ": None, "last_observation": None, "exchange_status": "completed" if exchange else "none"}
         self.store.put("goals", goal_id, state)
         self.store.put("episodes", episode["id"], episode)
         self._learn_neurons(decisions, text)
         self._save_models()
         self.organism._commit_state("awakening_episode")
         self._dissolve()
+        demands = self._structured_demands(goal_id, text, interpretations)
+        if demands:
+            episode["body"] = self._run_body_plan(state, demands, interpretations)
+            self.store.put("episodes", episode["id"], episode)
         return episode
+
+    def _dynamic_primary(self, text: str) -> tuple[str, Any]:
+        tokens = set(text.lower().split())
+        def score(item: tuple[str, Any]) -> tuple[float, str]:
+            name, colony = item; neurons = list(colony.neurons.values())
+            relevance = sum(bool(tokens & set(n.specialization.lower().split())) for n in neurons)
+            verified = sum(n.verified_contribution for n in neurons)
+            confidence = sum(n.confidence for n in neurons)/len(neurons)
+            cost = sum(n.metabolic_cost for n in neurons)/len(neurons)
+            novelty = 1/(1+len(colony.memories))
+            borrowed = sum(memory.startswith("borrowed-tested:") for memory in colony.memories)
+            return (relevance*2 + verified + confidence + novelty + borrowed - cost*.1, name)
+        return max(self.organism.colonies.items(), key=score)
+
+    def _integrated_exchange(self, goal_id: str, interpretations: dict[str, dict[str, Any]], triggered: bool) -> dict[str, Any] | None:
+        if not triggered or len(interpretations) < 2: return None
+        names = list(interpretations); source, target = names[0], names[1]
+        argument = interpretations[source]["argument"]
+        brief = SisterBrief(source, str(argument.get("hypotheses", [""])[0]), str(argument.get("next_useful_action", "")),
+                            tuple(map(str, argument.get("evidence_refs", ()))), float(argument.get("confidence", .5)),
+                            tuple(map(str, argument.get("critical_assumptions", argument.get("constraints", ())))),
+                            tuple(map(str, argument.get("unknowns", ()))), tuple(map(str, argument.get("capability_gaps", ()))),
+                            str(argument.get("prediction", "")))
+        target_view = SisterView(target, {})
+        response_name = str(interpretations[target]["argument"].get("sister_response", "CHALLENGE")).upper()
+        response = BriefResponse(response_name) if response_name in BriefResponse.__members__ else BriefResponse.CHALLENGE
+        if not self.sister_exchange.exchange(goal_id, SisterView(source, {}), target_view, brief, response,
+                                             trigger="material_disagreement", counterproposal=str(interpretations[target]["argument"].get("hypotheses", [""])[0])): return None
+        event = {"goal_id": goal_id, "round": self.sister_exchange.rounds[goal_id], "source": source, "target": target,
+                 "brief": asdict(brief), "response": response.value, "minority_hypotheses": target_view.minority_hypotheses}
+        self.embodiment_store.put("exchange", f"{goal_id}:{event['round']}", event); return event
+
+    def _structured_demands(self, goal_id: str, task: str, interpretations: dict[str, dict[str, Any]]) -> list[tuple[float, CapabilityDemand, dict[str, Any]]]:
+        candidates = []
+        for view in interpretations.values():
+            plans = view["argument"].get("body_demands", [])
+            if isinstance(view["argument"].get("body_demand"), dict): plans = [view["argument"]["body_demand"]]
+            for data in plans:
+                required = {"required_capability","intent","inputs","expected_output","expected_evidence","risk","side_effect_class","budget","reversibility","confidence"}
+                if not isinstance(data, dict) or not required <= set(data): raise ValueError("invalid structured body demand")
+                demand = CapabilityDemand(goal_id, task, str(data["required_capability"]), str(data["intent"]), dict(data["inputs"]),
+                    str(data["expected_evidence"]), float(data["risk"]), str(data["side_effect_class"]),
+                    str(data.get("network_need", "none")), str(data.get("filesystem_need", "none")),
+                    float(data.get("privacy", 1)), float(data["budget"]), bool(data["reversibility"]))
+                utility = float(data.get("goal_value",1))+float(data.get("information_gain",.5))+float(data.get("capability_gain",0)) \
+                    - float(data["budget"])-float(data["risk"])-(0 if data["reversibility"] else 1)-float(data.get("uncertainty",1-float(data["confidence"])))
+                candidates.append((utility, demand, data))
+        # Compare utilities within an inference stage, while cheap information-gathering
+        # actions precede actions whose output depends on that evidence.
+        return sorted(candidates, key=lambda x: (x[2]["side_effect_class"] not in {"none", "read"}, -x[0]))
+
+    def _run_body_plan(self, state: dict[str, Any], candidates: list[tuple[float, CapabilityDemand, dict[str, Any]]], interpretations: dict[str, dict[str, Any]]) -> dict[str, Any]:
+        observations = []; evidence = ""
+        # Execute the best candidate per intent in utility order, permitting research then save.
+        seen = set()
+        for _, demand, raw in candidates:
+            if demand.intent in seen: continue
+            seen.add(demand.intent)
+            if evidence and isinstance(demand.inputs.get("content"), str): demand.inputs["content"] = demand.inputs["content"].replace("{evidence}", evidence[:8000])
+            state.update(current_step="body_execution", current_organ=None); self.store.put("goals", state["id"], state)
+            resolved = self.capability_resolver.resolve(demand)
+            if resolved: state["current_organ"] = resolved[0].id; self.store.put("goals", state["id"], state)
+            result = self.action_loop.execute(demand)
+            if isinstance(result, HumanApprovalRequest): state.update(current_step="pending_approval", pending_approval=result.id); self.store.put("goals",state["id"],state); return {"status":"pending_approval","request":asdict(result)}
+            if not isinstance(result, ObservationEnvelope): state.update(current_step="capability_gap"); self.store.put("goals",state["id"],state); return {"status":"gap"}
+            verified = self.action_loop.verify(result, lambda obs: obs.success and bool(obs.content_hash))
+            observations.append(asdict(result)); state["last_observation"] = result.action_id
+            if verified and demand.required_capability == "filesystem" and demand.intent in {"write", "append"}:
+                for check in ("exists", "hash"):
+                    verification = CapabilityDemand(demand.goal_id, demand.task, "filesystem", check,
+                        {"path": demand.inputs["path"]}, f"written file {check}", risk=0,
+                        filesystem_need="workspace", budget=demand.budget)
+                    checked = self.action_loop.execute(verification)
+                    if isinstance(checked, ObservationEnvelope):
+                        self.action_loop.verify(checked, lambda obs: obs.success and bool(obs.result.get("exists", obs.result.get("sha256"))))
+                        observations.append(asdict(checked)); state["last_observation"] = checked.action_id
+            if verified:
+                evidence = result.result.get("text", json.dumps(result.result)) if isinstance(result.result, dict) else str(result.result)
+                primary_name, primary = self._dynamic_primary(state["description"]); lead = max(primary.neurons.values(), key=lambda n:n.confidence)
+                lead.verified_contribution += 1
+                digest = SisterDevelopmentDigest(primary_name,(demand.intent,),(),lead.specialization,demand.required_capability,
+                    "prefer verified organ",f"verify {demand.expected_output}",(result.action_id,),True)
+                other = next(name for name in self.organism.colonies if name != primary_name)
+                self.embodiment_store.put("digest", result.action_id, {**asdict(digest),"target":other,"response":"TEST_INDEPENDENTLY"})
+                self.organism.colonies[other].memories.append("borrowed-tested:"+digest.strategy_lesson)
+            state["current_step"] = "verified" if verified else "replan"; self.store.put("goals",state["id"],state)
+        state["status"] = "verified"; state["current_step"] = "complete"; self.store.put("goals",state["id"],state)
+        self.organism.memory.world_model["last_body_outcome"] = {"observations": observations, "verified": True}
+        self.organism._commit_state("verified_body_outcome")
+        return {"status":"verified", "observations":observations,
+                "final_response":"Completed real body actions; persisted and verified their observations."}
 
     def _best_colony(self, decisions: list[Any]) -> tuple[str, Any]:
         name = decisions[0].colony_name
@@ -275,6 +407,42 @@ class GodRuntime:
 
     def _save_models(self) -> None:
         for record in self.records.values(): self.store.put("models", record.key, asdict(record))
+
+    def operational_status(self) -> dict[str, Any]:
+        active = self.store.rows("SELECT state FROM goals ORDER BY rowid DESC LIMIT 1")
+        goal = json.loads(active[0]["state"]) if active else {}
+        observations = self.embodiment_store.all("observation"); approvals = self.embodiment_store.all("approval")
+        gaps = self.embodiment_store.all("gap"); exchanges = self.embodiment_store.all("exchange")
+        confidences = {name: round(sum(n.confidence for n in colony.neurons.values())/len(colony.neurons),3)
+                       for name,colony in self.organism.colonies.items()}
+        last = observations[-1] if observations else None
+        return {"current_goal": goal.get("description"), "work_class": goal.get("work_class"),
+                "current_step": goal.get("current_step","idle"), "current_organ": goal.get("current_organ"),
+                "last_observation": last, "pending_approval": next((a for a in reversed(approvals) if a["status"]=="pending"),None),
+                "capability_gaps": gaps, "a_confidence": confidences["Saphira-A"], "b_confidence": confidences["Saphira-B"],
+                "sister_exchange": exchanges[-1] if exchanges else None,
+                "latest_latency": last.get("latency_ms") if last else None}
+
+    def decide_approval(self, request_id: str, approve: bool) -> None:
+        if not approve:
+            self.permission_authority.deny(request_id, approver="Pier"); return
+        lease = self.permission_authority.approve(request_id, approver="Pier")
+        request = next(a for a in self.embodiment_store.all("approval") if a["id"] == request_id)
+        manifest = self.body_bus.manifests[request["organ"]]
+        capability = next(iter(manifest.capability_tags))
+        goal_rows = self.store.rows("SELECT state FROM goals WHERE id=?", (request["goal_id"],))
+        state = json.loads(goal_rows[0]["state"]) if goal_rows else {"id":request["goal_id"],"description":"approved task"}
+        demand = CapabilityDemand(request["goal_id"], state["description"], capability, request["operation"],
+                                  request["inputs"], "approved result", request["risk"], request["side_effect_class"],
+                                  request["scope"] if manifest.kind in {"web","openapi"} else "none",
+                                  request["scope"] if manifest.kind == "filesystem" else "none", budget=max(request["cost"], .000001),
+                                  reversible=request["reversible"])
+        result = self.action_loop.execute(demand, lease=lease)
+        if isinstance(result, ObservationEnvelope):
+            self.action_loop.verify(result, lambda observation: observation.success and bool(observation.content_hash))
+            state.update(status="verified", current_step="complete", current_organ=request["organ"],
+                         last_observation=result.action_id, pending_approval=None)
+            self.store.put("goals", state["id"], state)
 
     def chat(self, message: str) -> str:
         self.store.chat("user", message)
@@ -323,6 +491,7 @@ class GodRuntime:
 
     def close(self) -> None:
         self.organism.checkpoint()
+        self.embodiment_store.close()
         self.store.close()
 
     def __enter__(self) -> "GodRuntime": return self

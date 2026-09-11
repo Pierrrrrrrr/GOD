@@ -64,7 +64,7 @@ def classify_work(message: str, *, risk: float = 0, uncertainty: float = 0) -> W
     text = message.lower().strip()
     if text in {"hi", "hello", "status", "what are you doing?"}: return WorkClass.REFLEX
     if "background" in text: return WorkClass.BACKGROUND
-    if risk >= .6 or uncertainty >= .6 or any(x in text for x in ("research", "audit", "irreversible")): return WorkClass.DELIBERATIVE
+    if risk >= .6 or uncertainty >= .6 or any(x in text for x in ("research", "audit", "irreversible", "find a realistic way")): return WorkClass.DELIBERATIVE
     return WorkClass.FOCUSED
 
 

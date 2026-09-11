@@ -54,9 +54,12 @@ def test_openapi_permissions_and_gaps(tmp_path):
     bus=BodyBus(); bus.register(OrganManifest("mutator","openapi","1",{"mutate":{"required":[]}},permissions={"external.mutate"},risk=.2,side_effect_class="external-mutation",reversible=False,capability_tags={"mutation"}),{"mutate":lambda _: {"ok":1}})
     store=EmbodimentStore(tmp_path/"p.sqlite"); loop=ActionLoop(bus,store); d=CapabilityDemand("g","change","mutation","mutate",{},"changed",risk=1,budget=1,reversible=False)
     assert isinstance(loop.execute(d),HumanApprovalRequest)
-    bad=PermissionLease("l","Saphira-A",("external.mutate",),"Saphira-A",10**12); assert isinstance(loop.execute(d,lease=bad),HumanApprovalRequest)
-    good=PermissionLease("l2","Pier",("external.mutate",),"Pier",10**12); store.put("lease",good.id,good); assert loop.execute(d,lease=good).success
-    with pytest.raises(PermissionDenied): PermissionAuthority(store).issue("Saphira-A","Saphira-A",("external.mutate",),60)
+    pending=loop.execute(d); authority=PermissionAuthority(store)
+    approved=authority.approve(pending.id,approver="Pier"); assert approved.organ=="mutator" and approved.operation=="mutate"
+    denied=loop.execute(d); authority.deny(denied.id,approver="Pier"); assert any(a["status"]=="denied" for a in store.all("approval"))
+    bad=PermissionLease("l","Saphira-A",("external.mutate",),"Saphira-A","none","mutator","mutate",1,"external-mutation",False,0,10**12); assert isinstance(loop.execute(d,lease=bad),HumanApprovalRequest)
+    good=PermissionLease("l2","body",("external.mutate",),"Pier","none","mutator","mutate",1,"external-mutation",False,0,10**12); store.put("lease",good.id,good); assert loop.execute(d,lease=good).success
+    with pytest.raises(PermissionDenied): authority.issue("Saphira-A","Saphira-A",("external.mutate",),60,scope="none",organ="mutator",operation="mutate",maximum_cost=1,side_effect_class="external-mutation",reversible_only=False)
     assert CapabilityResolver(bus,store).resolve(CapabilityDemand("g","x","sandbox","run",{},"x",risk=1,budget=1)) is None
     store.close()
 
@@ -65,7 +68,7 @@ def test_body_state_and_manifest_survive_restart(tmp_path):
     store=EmbodimentStore(tmp_path/"restart.sqlite"); bus=BodyBus(); organ=WorkspaceFilesystemOrgan(tmp_path/"ws")
     manifest=OrganManifest("workspace","filesystem","1",organ.OPERATIONS,capability_tags={"filesystem"})
     OrganRegistry(bus,store).register(manifest,{name:(lambda args,name=name:organ.handle(name,args)) for name in organ.OPERATIONS})
-    authority=PermissionAuthority(store); authority.issue("Pier","body",("workspace.write",),60)
+    authority=PermissionAuthority(store); authority.issue("Pier","body",("workspace.write",),60,scope="workspace",organ="workspace",operation="write",maximum_cost=0,side_effect_class="workspace",reversible_only=True)
     CapabilityResolver(bus,store).resolve(CapabilityDemand("goal","missing","mcp","invoke",{},"result",risk=1,budget=1))
     store.put("goal","goal",{"id":"goal","status":"active"}); store.close()
     restored=EmbodimentStore(tmp_path/"restart.sqlite"); catalog=OrganRegistry(BodyBus(),restored).persisted()
@@ -81,6 +84,27 @@ def test_optional_boundaries_are_honest_and_private_data_filtered():
     with pytest.raises(SandboxUnavailable): SandboxBus().execute({"code":"x"})
     manifest=normalize_a2a_card({"name":"peer","url":"https://peer","skills":[{"id":"search"}],"credentials":"secret","private_topology":{"x":1}})
     assert manifest.trusted is False and "secret" not in json.dumps(manifest.operations)
+
+
+def test_openapi_side_effect_uses_scoped_lease_and_controlled_transport(tmp_path):
+    received={}
+    class API(BaseHTTPRequestHandler):
+        def do_POST(self):
+            received["path"]=self.path; received["body"]=json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+            self.send_response(201); self.send_header("Content-Type","application/json"); self.end_headers(); self.wfile.write(b'{"created":true}')
+        def log_message(self,*_): pass
+    server=HTTPServer(("127.0.0.1",0),API); worker=threading.Thread(target=server.serve_forever); worker.start()
+    try:
+        document={"servers":[{"url":f"http://127.0.0.1:{server.server_port}"}],"paths":{"/items":{"post":{"operationId":"create","parameters":[{"name":"trace","in":"query","required":True}],"requestBody":{"required":True,"content":{"application/json":{"schema":{"required":["name"]}}}}}}}}
+        api=OpenAPIOrgan(document,WebResearchOrgan(test_allow_hosts={"127.0.0.1"})); bus=BodyBus()
+        manifest=OrganManifest("api","openapi","1",{"create":{"required":["trace","body"]}},permissions={"api.create"},risk=.3,side_effect_class="external-mutation",reversible=False,capability_tags={"openapi"})
+        bus.register(manifest,{"create":lambda args:api.execute("create",args)}); store=EmbodimentStore(tmp_path/"api.sqlite"); loop=ActionLoop(bus,store)
+        demand=CapabilityDemand("g","create","openapi","create",{"trace":"t1","body":{"name":"safe"}},"201",risk=1,network_need="controlled-test",budget=1,reversible=False)
+        pending=loop.execute(demand); assert isinstance(pending,HumanApprovalRequest)
+        lease=PermissionAuthority(store).approve(pending.id,approver="Pier"); observed=loop.execute(demand,lease=lease)
+        assert observed.success and observed.result["status"]==201 and received=={"path":"/items?trace=t1","body":{"name":"safe"}}
+        store.close()
+    finally: server.shutdown(); worker.join(); server.server_close()
 
 
 def test_selective_exchange_digest_speed_and_diversity():

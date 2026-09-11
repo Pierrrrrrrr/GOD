@@ -1,12 +1,13 @@
 """Phase 2B: capability resolution, permissioned organs, and durable observations."""
 from __future__ import annotations
 
-import hashlib, ipaddress, json, mimetypes, socket, sqlite3, time
+import hashlib, ipaddress, json, socket, sqlite3, time
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
-from urllib.request import Request, urlopen
+from urllib.error import HTTPError
+from urllib.request import HTTPRedirectHandler, Request, build_opener
 from uuid import uuid4
 
 from .buses import BodyBus, OrganManifest, ProviderUnavailable
@@ -32,14 +33,22 @@ class CapabilityGap:
 @dataclass(slots=True)
 class PermissionLease:
     id: str; principal: str; permissions: tuple[str, ...]; issued_by: str
-    expires_at: float; revoked: bool = False
-    def permits(self, permission: str, now: float | None = None) -> bool:
-        return not self.revoked and self.issued_by == "Pier" and (now or time.time()) < self.expires_at and permission in self.permissions
+    scope: str; organ: str; operation: str; maximum_cost: float
+    allowed_side_effect_class: str; reversible_only: bool; created_at: float; expires_at: float
+    status: str = "active"
+    def permits(self, permission: str, *, organ: str, operation: str, scope: str,
+                cost: float, side_effect_class: str, reversible: bool, now: float | None = None) -> bool:
+        return (self.status == "active" and self.issued_by == "Pier" and (now or time.time()) < self.expires_at
+                and permission in self.permissions and self.organ == organ and self.operation == operation
+                and self.scope == scope and cost <= self.maximum_cost
+                and self.allowed_side_effect_class == side_effect_class
+                and (not self.reversible_only or reversible))
 
 @dataclass(slots=True)
 class HumanApprovalRequest:
     id: str; goal_id: str; organ: str; operation: str; permission: str
-    reason: str; status: str = "pending"; requested_at: float = field(default_factory=time.time)
+    reason: str; scope: str; risk: float; cost: float; side_effect_class: str; reversible: bool
+    inputs: dict[str, Any]; status: str = "pending"; requested_at: float = field(default_factory=time.time)
 
 @dataclass(slots=True)
 class ObservationEnvelope:
@@ -48,10 +57,12 @@ class ObservationEnvelope:
     evidence_refs: tuple[str, ...]; provenance: str; content_hash: str
     cost: float; latency_ms: float; side_effects: str
     verification_state: str = "unverified"; error_class: str | None = None
+    actual_outcome: str | None = None; prediction_error: str | None = None
 
 @dataclass(slots=True)
 class Prediction:
-    action_id: str; goal_id: str; expected: str; created_at: float
+    action_id: str; goal_id: str; expected: str; expected_evidence: str; confidence: float
+    expected_value: float; information_gain: float; risk: float; cost: float; created_at: float
 
 
 class EmbodimentStore:
@@ -103,10 +114,29 @@ class OrganRegistry:
 class PermissionAuthority:
     """Pier is the sole lease issuer; cognitive principals can only request."""
     def __init__(self, store: EmbodimentStore): self.store = store
-    def issue(self, approver: str, principal: str, permissions: tuple[str, ...], duration_seconds: float) -> PermissionLease:
+    def issue(self, approver: str, principal: str, permissions: tuple[str, ...], duration_seconds: float,
+              *, scope: str, organ: str, operation: str, maximum_cost: float,
+              side_effect_class: str, reversible_only: bool) -> PermissionLease:
         if approver != "Pier": raise PermissionDenied("models and colonies cannot approve permission requests")
-        lease = PermissionLease(uuid4().hex, principal, permissions, approver, time.time()+duration_seconds)
+        now = time.time()
+        lease = PermissionLease(uuid4().hex, principal, permissions, approver, scope, organ, operation,
+                                maximum_cost, side_effect_class, reversible_only, now, now+duration_seconds)
         self.store.put("lease", lease.id, lease); return lease
+    def approve(self, request_id: str, *, approver: str, principal: str = "body", duration_seconds: float = 300) -> PermissionLease:
+        matches = [x for x in self.store.all("approval") if x["id"] == request_id]
+        if not matches: raise KeyError(request_id)
+        request = matches[-1]
+        if request["status"] != "pending": raise PermissionDenied("approval request is not pending")
+        lease = self.issue(approver, principal, (request["permission"],), duration_seconds,
+                           scope=request["scope"], organ=request["organ"], operation=request["operation"],
+                           maximum_cost=request["cost"], side_effect_class=request["side_effect_class"],
+                           reversible_only=request["reversible"])
+        request["status"] = "approved"; self.store.put("approval", request_id, request); return lease
+    def deny(self, request_id: str, *, approver: str) -> None:
+        if approver != "Pier": raise PermissionDenied("only Pier may deny requests")
+        matches = [x for x in self.store.all("approval") if x["id"] == request_id]
+        if not matches: raise KeyError(request_id)
+        request = matches[-1]; request["status"] = "denied"; self.store.put("approval", request_id, request)
 
 
 class WorkspaceFilesystemOrgan:
@@ -147,8 +177,12 @@ class WebResearchOrgan:
     def request(self, args: dict[str, Any]) -> dict[str, Any]:
         url, method = str(args["url"]), str(args.get("method", "GET")).upper()
         if method not in {"GET", "HEAD"}: raise PermissionDenied("web research is read-only")
-        self._validate(url); started = time.monotonic()
-        with urlopen(Request(url, method=method), timeout=float(args.get("timeout", 15))) as response:
+        self._validate(url); started = time.monotonic(); owner = self
+        class SafeRedirect(HTTPRedirectHandler):
+            def redirect_request(self, req: Any, fp: Any, code: int, msg: str, headers: Any, newurl: str) -> Any:
+                owner._validate(newurl)
+                return super().redirect_request(req, fp, code, msg, headers, newurl)
+        with build_opener(SafeRedirect()).open(Request(url, method=method), timeout=float(args.get("timeout", 15))) as response:
             body = response.read(2_000_000); mime = response.headers.get_content_type()
             text = body.decode(response.headers.get_content_charset() or "utf-8", errors="replace") if mime.startswith("text/") or mime in {"application/json", "application/xml"} else ""
             title = ""
@@ -172,12 +206,31 @@ class OpenAPIOrgan:
         required = {p["name"] for p in spec.get("parameters", []) if p.get("required")}
         missing = required-set(inputs)
         if missing: raise ValueError(f"missing required OpenAPI inputs: {sorted(missing)}")
-        for name, value in inputs.items(): path = path.replace("{"+name+"}", str(value))
+        for parameter in spec.get("parameters", []):
+            name = parameter["name"]
+            if parameter.get("in", "path") == "path" and name in inputs: path = path.replace("{"+name+"}", str(inputs[name]))
+        body_schema = spec.get("requestBody", {}).get("content", {}).get("application/json", {}).get("schema", {})
+        if spec.get("requestBody", {}).get("required") and "body" not in inputs: raise ValueError("request body is required")
+        missing_body = set(body_schema.get("required", []))-set(inputs.get("body", {}))
+        if missing_body: raise ValueError(f"missing required request body fields: {sorted(missing_body)}")
         return method, path
     def execute(self, operation: str, inputs: dict[str, Any]) -> dict[str, Any]:
         method, path = self.validate(operation, inputs)
-        base = self.document.get("servers", [{}])[0].get("url", "")
-        return self.web.request({"url": base.rstrip("/")+"/"+path.lstrip("/"), "method": method})
+        base = self.document.get("servers", [{}])[0].get("url", ""); spec = self.operations()[operation][2]
+        from urllib.parse import urlencode
+        query = {p["name"]: inputs[p["name"]] for p in spec.get("parameters", []) if p.get("in") == "query" and p["name"] in inputs}
+        url = base.rstrip("/")+"/"+path.lstrip("/") + (("?"+urlencode(query)) if query else "")
+        if method in {"GET", "HEAD"}: return self.web.request({"url": url, "method": method})
+        self.web._validate(url)
+        payload = json.dumps(inputs.get("body", {})).encode(); started = time.monotonic()
+        request = Request(url, data=payload, method=method, headers={"Content-Type": "application/json"})
+        class NoMutationRedirect(HTTPRedirectHandler):
+            def redirect_request(self, *args: Any, **kwargs: Any) -> Any: return None
+        with build_opener(NoMutationRedirect()).open(request, timeout=15) as response:
+            body = response.read(2_000_000)
+            return {"requested_url": url, "final_url": response.url, "timestamp": time.time(), "status": response.status,
+                    "mime_type": response.headers.get_content_type(), "content_hash": hashlib.sha256(body).hexdigest(),
+                    "text": body.decode("utf-8", errors="replace"), "latency_ms": (time.monotonic()-started)*1000}
 
 
 class MCPAdapter:
@@ -212,13 +265,17 @@ class ActionLoop:
     def execute(self, demand: CapabilityDemand, *, lease: PermissionLease | None = None) -> ObservationEnvelope | HumanApprovalRequest | CapabilityGap:
         resolved = self.resolver.resolve(demand)
         if not resolved: return CapabilityGap(**self.store.all("gap")[-1])
-        organ, operation = resolved; permission = next(iter(organ.permissions), "")
+        organ, operation = resolved; permission = next(iter(organ.permissions), ""); scope = demand.network_need if demand.network_need != "none" else demand.filesystem_need
         dangerous = operation.upper() in {"POST","PUT","PATCH","DELETE"} or organ.side_effect_class not in {"read","workspace"} or not organ.reversible
-        if dangerous and (lease is None or not lease.permits(permission)):
-            request = HumanApprovalRequest(uuid4().hex, demand.goal_id, organ.id, operation, permission, "side effect requires Pier approval")
+        if dangerous and (lease is None or not lease.permits(permission, organ=organ.id, operation=operation,
+                scope=scope, cost=organ.cost, side_effect_class=organ.side_effect_class, reversible=organ.reversible)):
+            request = HumanApprovalRequest(uuid4().hex, demand.goal_id, organ.id, operation, permission,
+                "side effect requires Pier approval", scope, demand.risk, organ.cost, organ.side_effect_class,
+                organ.reversible, demand.inputs)
             self.store.put("approval", request.id, request); return request
         action_id = uuid4().hex
-        prediction = Prediction(action_id, demand.goal_id, demand.expected_output, time.time()); self.store.put("prediction", action_id, prediction)
+        prediction = Prediction(action_id, demand.goal_id, demand.expected_output, demand.expected_output, .5,
+                                1.0, .5, demand.risk, organ.cost, time.time()); self.store.put("prediction", action_id, prediction)
         started = time.time()
         try:
             result = self.bus.request(organ.id, operation, demand.inputs); success, error = True, None
@@ -231,6 +288,9 @@ class ActionLoop:
         self.store.put("observation", action_id, observation); return observation
     def verify(self, observation: ObservationEnvelope, verifier: Any) -> bool:
         verified = bool(observation.success and verifier(observation)); observation.verification_state = "verified" if verified else "rejected"
+        observation.actual_outcome = "success" if observation.success else "failure"
+        prediction = next((p for p in self.store.all("prediction") if p["action_id"] == observation.action_id), None)
+        observation.prediction_error = None if verified else f"expected {prediction['expected'] if prediction else 'success'}; observed {observation.actual_outcome}"
         self.store.put("observation", observation.action_id, observation); return verified
     @staticmethod
     def completion(observation: ObservationEnvelope | None) -> str:

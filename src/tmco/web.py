@@ -25,6 +25,7 @@ fieldset{border:1px solid #456;margin:1rem 0}input,select,button{padding:.65rem;
 input[name=message]{width:70%}#chat{white-space:pre-wrap;background:#171c26;padding:1rem;min-height:12rem}</style></head>
 <body><h1>G.O.D. — Awakening</h1><p>Local-only control surface. Keys disappear after submission.</p>
 <div id=status>{status}</div>
+{approval}
 <fieldset><legend>INTELLIGENCE</legend>
 <form method=post action=/import><input name=path placeholder="secrets.json path" required>
 <label><input type=checkbox name=delete value=yes>Delete source file after secure import</label>
@@ -185,18 +186,21 @@ class App:
                      f"Intelligence {intelligence}"]
         lines.append(f"Discovered providers: {len(self.runtime.bus.providers)}; models: {len(self.runtime.records)}")
         lines.append(f"Routing: {self.runtime.routing_policy}")
-        active = self.runtime.store.rows(
-            "SELECT description FROM goals WHERE status='active' ORDER BY rowid DESC LIMIT 1")
-        if active:
-            lines.extend((f"Current goal: {active[0]['description']}", "Current step: reasoning",
-                          "Work class: DELIBERATIVE", "Current body organ: none",
-                          "A confidence: pending", "B confidence: pending"))
-        else:
-            lines.extend(("Current goal: none", "Current step: idle", "Work class: REFLEX",
-                          "Current body organ: none", "A confidence: n/a", "B confidence: n/a"))
-        lines.extend(("Last observation: none", "Pending approval: none", "Capability gaps: none",
-                      "Sister exchange: none", "Latest latency: n/a"))
+        state = self.runtime.operational_status(); show = lambda value: "none" if value is None or value == [] else str(value)
+        lines.extend((f"Current goal: {show(state['current_goal'])}", f"Current step: {state['current_step']}",
+                      f"Work class: {show(state['work_class'])}", f"Current body organ: {show(state['current_organ'])}",
+                      f"Last observation: {show(state['last_observation'])}", f"Pending approval: {show(state['pending_approval'])}",
+                      f"Capability gaps: {show(state['capability_gaps'])}", f"A confidence: {state['a_confidence']}",
+                      f"B confidence: {state['b_confidence']}", f"Sister exchange: {show(state['sister_exchange'])}",
+                      f"Latest latency: {show(state['latest_latency'])}"))
         return "<br>".join(html.escape(line) for line in lines)
+
+    def approval(self) -> str:
+        request = self.runtime.operational_status()["pending_approval"]
+        if not request: return ""
+        details = html.escape(json.dumps({k:request[k] for k in ("reason","organ","operation","scope","risk","cost","reversible")}, sort_keys=True))
+        identity = html.escape(request["id"])
+        return f'<fieldset><legend>PENDING APPROVAL</legend><p>{details}</p><form method=post action=/approve><input type=hidden name=id value="{identity}"><button>APPROVE</button></form><form method=post action=/deny><input type=hidden name=id value="{identity}"><button>DENY</button></form></fieldset>'
 
     def chat(self, message: str) -> str:
         return self.runtime.chat(message)
@@ -209,7 +213,7 @@ def serve(data: Path, port: int, *, open_browser: bool = True) -> None:
     app = App(data)
     class Handler(BaseHTTPRequestHandler):
         def page(self) -> None:
-            body = PAGE.replace("{status}", app.status()).replace(
+            body = PAGE.replace("{status}", app.status()).replace("{approval}", app.approval()).replace(
                 "{chat}", html.escape("\n".join(app.transcript))).encode()
             self.send_response(200); self.send_header("Content-Type", "text/html; charset=utf-8")
             self.send_header("Content-Length", str(len(body))); self.end_headers(); self.wfile.write(body)
@@ -232,6 +236,9 @@ def serve(data: Path, port: int, *, open_browser: bool = True) -> None:
                 elif self.path == "/policy":
                     app.runtime.set_routing_policy(fields.get("policy", "AUTO"))
                     response = f"Routing policy: {app.runtime.routing_policy}."
+                elif self.path in {"/approve", "/deny"}:
+                    app.runtime.decide_approval(fields["id"], self.path == "/approve")
+                    response = "Approval recorded by Pier." if self.path == "/approve" else "Request denied by Pier."
                 else:
                     message = fields.get("message", ""); response = app.chat(message)
                     app.transcript.append(f"Pier: {message}\nG.O.D.: {response}")
