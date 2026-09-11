@@ -11,8 +11,9 @@ from uuid import uuid4
 
 from .buses import BodyBus, ModelBus, ModelProvider, OrganManifest, ProviderUnavailable
 from .embodiment import (ActionLoop, CapabilityDemand, CapabilityResolver, EmbodimentStore,
-                         HumanApprovalRequest, ObservationEnvelope, OrganRegistry,
-                         PermissionAuthority, VerificationLevel, WebResearchOrgan,
+                         DecisionProvenance, HumanApprovalRequest, ObservationEnvelope,
+                         OrganRegistry, OutcomeEvaluation, OutcomeEvaluator, PermissionAuthority,
+                         VerificationLevel, WebResearchOrgan,
                          WorkspaceFilesystemOrgan)
 from .executive import Cognition
 from .models import ModelRecord, ModelRouter
@@ -279,7 +280,7 @@ class GodRuntime:
         self._save_models()
         self.organism._commit_state("awakening_episode")
         self._dissolve()
-        demands = self._structured_demands(goal_id, text, interpretations)
+        demands = self._structured_demands(goal_id, episode["id"], text, interpretations, decisions)
         if demands:
             episode["body"] = self._run_body_plan(state, demands, interpretations)
             self.store.put("episodes", episode["id"], episode)
@@ -324,9 +325,10 @@ class GodRuntime:
                  "minority_hypotheses": target_view.minority_hypotheses}
         self.embodiment_store.put("exchange", f"{goal_id}:{event['round']}", event); return event
 
-    def _structured_demands(self, goal_id: str, task: str, interpretations: dict[str, dict[str, Any]]) -> list[tuple[float, CapabilityDemand, dict[str, Any]]]:
+    def _structured_demands(self, goal_id: str, episode_id: str, task: str,
+                            interpretations: dict[str, dict[str, Any]], decisions: list[Any]) -> list[tuple[float, CapabilityDemand, dict[str, Any]]]:
         candidates = []
-        for view in interpretations.values():
+        for source_colony, view in interpretations.items():
             plans = view["argument"].get("body_demands", [])
             if isinstance(view["argument"].get("body_demand"), dict): plans = [view["argument"]["body_demand"]]
             for data in plans:
@@ -335,9 +337,17 @@ class GodRuntime:
                 if str(data["required_capability"]).lower() in {"shell", "code", "subprocess"}:
                     raise ValueError("arbitrary shell/code body demands are forbidden")
                 demand = CapabilityDemand(goal_id, task, str(data["required_capability"]), str(data["intent"]), dict(data["inputs"]),
-                    str(data["expected_evidence"]), float(data["risk"]), str(data["side_effect_class"]),
+                    str(data["expected_output"]), float(data["risk"]), str(data["side_effect_class"]),
                     str(data.get("network_need", "none")), str(data.get("filesystem_need", "none")),
-                    float(data.get("privacy", 1)), float(data["budget"]), bool(data["reversibility"]))
+                    float(data.get("privacy", 1)), float(data["budget"]), bool(data["reversibility"]),
+                    str(data["expected_evidence"]), float(data["confidence"]), float(data["goal_value"]),
+                    float(data["information_gain"]), float(data["capability_gain"]), float(data["uncertainty"]))
+                neuron_ids = tuple(n for decision in decisions if decision.colony_name == source_colony for n in decision.neuron_ids)
+                assembly_ids = tuple(decision.assembly_id for decision in decisions if decision.colony_name == source_colony)
+                provenance = DecisionProvenance(uuid4().hex, goal_id, episode_id, source_colony,
+                    view["model"], assembly_ids, neuron_ids, demand.id, time.time())
+                demand.decision_provenance_id = provenance.id
+                self.embodiment_store.put("decision_provenance", provenance.id, provenance)
                 utility = float(data.get("goal_value",1))+float(data.get("information_gain",.5))+float(data.get("capability_gain",0)) \
                     - float(data["budget"])-float(data["risk"])-(0 if data["reversibility"] else 1)-float(data.get("uncertainty",1-float(data["confidence"])))
                 candidates.append((utility, demand, data))
@@ -377,31 +387,52 @@ class GodRuntime:
             if verified:
                 evidence = result.result.get("text", json.dumps(result.result)) if isinstance(result.result, dict) else str(result.result)
             state["current_step"] = "verified" if verified else "replan"; self.store.put("goals",state["id"],state)
-        state["status"] = "verified"; state["current_step"] = "complete"; self.store.put("goals",state["id"],state)
+        state["status"] = "awaiting_outcome"; state["current_step"] = "AWAITING_OUTCOME"; self.store.put("goals",state["id"],state)
         self.organism.memory.world_model["last_body_outcome"] = {"observations": observations,
             "verification_level": VerificationLevel.ARTIFACT_VERIFIED.value}
         self.organism._commit_state("observed_body_execution")
         return {"status":"executed", "observations":observations,
                 "final_response":"Completed real body actions and verified their transport/artifacts; cognitive outcome remains unverified."}
 
-    def evaluate_outcome(self, observation_id: str, *, evidence_refs: tuple[str, ...],
-                         correct: bool, task: str = "goal_reasoning") -> bool:
+    def evaluate_outcome(self, evaluation: OutcomeEvaluation, *, task: str = "goal_reasoning") -> bool:
         """External/evaluable outcome gate; transport success alone cannot call this."""
-        if not evidence_refs: raise ValueError("outcome verification requires real evidence references")
-        data = next(o for o in self.embodiment_store.all("observation") if o["action_id"] == observation_id)
+        if evaluation.evaluator not in OutcomeEvaluator.__members__:
+            raise PermissionError("models and colonies are not trusted outcome evaluators")
+        if not evaluation.evidence_refs: raise ValueError("outcome verification requires real evidence references")
+        data = next(o for o in self.embodiment_store.all("observation") if o["action_id"] == evaluation.observation_id)
         observation = ObservationEnvelope(**{**data, "evidence_refs": tuple(data["evidence_refs"])})
-        if not correct: return self.action_loop.verify(observation, lambda _: False, VerificationLevel.OUTCOME_VERIFIED)
+        self.embodiment_store.put("outcome_evaluation", evaluation.observation_id, evaluation)
+        if not evaluation.correct: return self.action_loop.verify(observation, lambda _: False, VerificationLevel.OUTCOME_VERIFIED)
+        if not observation.decision_provenance_id: return False
+        matches = [p for p in self.embodiment_store.all("decision_provenance") if p["id"] == observation.decision_provenance_id]
+        if len(matches) != 1: return False
+        provenance = matches[0]
+        if not provenance.get("source_colony") or not provenance.get("source_model_key") or not provenance.get("source_neuron_ids"): return False
         self.action_loop.verify(observation, lambda _: True, VerificationLevel.OUTCOME_VERIFIED)
-        primary_name, primary = self._dynamic_primary(observation.task)
-        lead = max(primary.neurons.values(), key=lambda n:n.confidence); lead.verified_contribution += 1
-        record = next(iter(self.records.values()), None)
+        colony = self.organism.colonies[provenance["source_colony"]]
+        for neuron_id in provenance["source_neuron_ids"]: colony.neurons[neuron_id].verified_contribution += 1
+        record = self.records.get(provenance["source_model_key"])
         if record is not None: self.router.observe_verified_outcome(record, task, True)
-        digest = SisterDevelopmentDigest(primary_name,(observation.operation,),(),lead.specialization,None,
-            "route by outcome evidence", "retain outcome-verified strategy", evidence_refs, True)
-        other = next(name for name in self.organism.colonies if name != primary_name)
-        self.embodiment_store.put("digest", observation_id, {**asdict(digest),"target":other,"response":"TEST_INDEPENDENTLY"})
-        self.organism.colonies[other].memories.append("borrowed-tested:"+digest.strategy_lesson)
+        digest = SisterDevelopmentDigest(provenance["source_colony"],(observation.operation,),(),None,None,
+            "route by outcome evidence", "retain outcome-verified strategy", evaluation.evidence_refs, True)
+        other = next(name for name in self.organism.colonies if name != provenance["source_colony"])
+        self.embodiment_store.put("digest", evaluation.observation_id, {**asdict(digest),"observation_id":evaluation.observation_id,
+            "target":other,"response":"PENDING"})
+        goal_rows = self.store.rows("SELECT state FROM goals WHERE id=?", (observation.goal_id,))
+        if goal_rows:
+            goal = json.loads(goal_rows[0]["state"]); goal.update(status="outcome_verified", current_step="OUTCOME_VERIFIED")
+            self.store.put("goals", observation.goal_id, goal)
         self.organism._commit_state("outcome_verified_learning"); self._save_models(); return True
+
+    def respond_to_digest(self, observation_id: str, sister: str, response: DigestResponse) -> None:
+        data = next(d for d in self.embodiment_store.all("digest") if d.get("observation_id") == observation_id
+                    and d.get("target") == sister and d.get("response") == "PENDING")
+        data["response"] = response.value
+        if response == DigestResponse.ADOPT: self.organism.colonies[sister].memories.append("candidate-strategy:"+data["strategy_lesson"])
+        elif response == DigestResponse.TEST_INDEPENDENTLY: self.embodiment_store.put("borrowed_hypothesis", observation_id,
+            {"sister":sister,"lesson":data["strategy_lesson"],"verified":False})
+        elif response == DigestResponse.PRESERVE_ALTERNATIVE: self.organism.colonies[sister].memories.append("alternative:"+data["strategy_lesson"])
+        self.embodiment_store.put("digest", observation_id, data)
 
     def _best_colony(self, decisions: list[Any]) -> tuple[str, Any]:
         name = decisions[0].colony_name

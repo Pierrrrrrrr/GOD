@@ -27,6 +27,23 @@ class VerificationLevel(StrEnum):
     OUTCOME_VERIFIED = "OUTCOME_VERIFIED"
 
 
+class OutcomeEvaluator(StrEnum):
+    OWNER = "OWNER"; REGISTERED_VERIFIER = "REGISTERED_VERIFIER"; OBJECTIVE_TEST = "OBJECTIVE_TEST"
+
+
+@dataclass(frozen=True, slots=True)
+class OutcomeEvaluation:
+    observation_id: str; evaluator: str; evidence_refs: tuple[str, ...]; correct: bool
+    outcome: str; timestamp: float; reason: str
+
+
+@dataclass(frozen=True, slots=True)
+class DecisionProvenance:
+    id: str; goal_id: str; episode_id: str; source_colony: str | None
+    source_model_key: str | None; source_assembly_ids: tuple[str, ...]; source_neuron_ids: tuple[str, ...]
+    body_demand_id: str; created_at: float
+
+
 class ExternalComponentTrust(StrEnum):
     DISCOVERED = "DISCOVERED"; INSPECTED = "INSPECTED"; QUARANTINED = "QUARANTINED"
     TESTED = "TESTED"; SISTER_AUDITED = "SISTER_AUDITED"; APPROVED = "APPROVED"; REJECTED = "REJECTED"
@@ -49,6 +66,9 @@ class CapabilityDemand:
     risk: float = 0; side_effects: str = "none"; network_need: str = "none"
     filesystem_need: str = "none"; privacy: float = 1; budget: float = 0
     reversible: bool = True
+    expected_evidence: str = ""; confidence: float = 0; goal_value: float = 0
+    information_gain: float = 0; capability_gain: float = 0; uncertainty: float = 1
+    id: str = field(default_factory=lambda: uuid4().hex); decision_provenance_id: str | None = None
 
 @dataclass(slots=True)
 class CapabilityGap:
@@ -82,11 +102,13 @@ class ObservationEnvelope:
     cost: float; latency_ms: float; side_effects: str
     verification_state: str = VerificationLevel.UNVERIFIED.value; error_class: str | None = None
     actual_outcome: str | None = None; prediction_error: str | None = None
+    decision_provenance_id: str | None = None; prediction_id: str | None = None
 
 @dataclass(slots=True)
 class Prediction:
     action_id: str; goal_id: str; expected: str; expected_evidence: str; confidence: float
     expected_value: float; information_gain: float; risk: float; cost: float; created_at: float
+    capability_gain: float = 0; uncertainty: float = 1; decision_provenance_id: str | None = None
 
 
 class EmbodimentStore:
@@ -298,8 +320,11 @@ class ActionLoop:
                 organ.reversible, demand.inputs)
             self.store.put("approval", request.id, request); return request
         action_id = uuid4().hex
-        prediction = Prediction(action_id, demand.goal_id, demand.expected_output, demand.expected_output, .5,
-                                1.0, .5, demand.risk, organ.cost, time.time()); self.store.put("prediction", action_id, prediction)
+        prediction = Prediction(action_id, demand.goal_id, demand.expected_output, demand.expected_evidence,
+                                demand.confidence, demand.goal_value, demand.information_gain, demand.risk,
+                                organ.cost, time.time(), demand.capability_gain, demand.uncertainty,
+                                demand.decision_provenance_id)
+        self.store.put("prediction", action_id, prediction)
         started = time.time()
         try:
             result = self.bus.request(organ.id, operation, demand.inputs); success, error = True, None
@@ -308,7 +333,8 @@ class ActionLoop:
         finished = time.time(); digest = hashlib.sha256(json.dumps(result, sort_keys=True, default=str).encode()).hexdigest()
         observation = ObservationEnvelope(action_id, demand.goal_id, demand.task, organ.id, operation, started, finished,
                                           success, result, (f"sha256:{digest}",), organ.provenance, digest, organ.cost,
-                                          (finished-started)*1000, organ.side_effect_class, error_class=error)
+                                          (finished-started)*1000, organ.side_effect_class, error_class=error,
+                                          decision_provenance_id=demand.decision_provenance_id, prediction_id=action_id)
         self.store.put("observation", action_id, observation); return observation
     def verify(self, observation: ObservationEnvelope, verifier: Any,
                level: VerificationLevel = VerificationLevel.ARTIFACT_VERIFIED) -> bool:

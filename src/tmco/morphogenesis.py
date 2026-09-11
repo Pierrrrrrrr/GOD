@@ -12,6 +12,7 @@ class FormationDecision:
     colony_name: str
     purpose: AssemblyPurpose
     neuron_ids: tuple[str, ...]
+    assembly_id: str
 
 
 class AssemblyFormationPolicy:
@@ -40,9 +41,9 @@ class AssemblyFormationPolicy:
             ranked = sorted(colony.neurons.values(), key=lambda neuron: (
                 -self._neuron_score(colony, neuron, goal, purpose, used), neuron.id))
             members = tuple(neuron.id for neuron in ranked[:affordable])
-            colony.form_assembly(purpose, members, budgets[name])
+            assembly = colony.form_assembly(purpose, members, budgets[name])
             used.update(members)
-            decisions.append(FormationDecision(name, purpose, members))
+            decisions.append(FormationDecision(name, purpose, members, assembly.id))
         return decisions
 
     def _colony_score(self, name: str, colony: Colony, goal: Goal,

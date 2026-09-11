@@ -4,7 +4,10 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 
 from tmco.awakening import GodRuntime
+from tmco.embodiment import OutcomeEvaluation
 from tmco.models import ModelRecord
+from tmco.sisters import DigestResponse
+import time
 
 
 class BodyPlanningProvider:
@@ -56,11 +59,30 @@ def test_real_godruntime_research_save_sister_digest_and_restart(tmp_path: Path)
         assert sum(n.verified_contribution for c in runtime.organism.colonies.values() for n in c.neurons.values())==0
         assert not any(record.task_performance for record in runtime.records.values())
         assert runtime.body_bus.manifests["web-research"].verified_reliability > .8
+        assert runtime.operational_status()["current_step"]=="AWAITING_OUTCOME"
         observation_id=episode["body"]["observations"][0]["action_id"]
-        assert runtime.evaluate_outcome(observation_id,evidence_refs=("human-evaluation:1",),correct=True)
+        prediction=next(p for p in runtime.embodiment_store.all("prediction") if p["action_id"]==observation_id)
+        assert (prediction["expected"],prediction["expected_evidence"])==("official evidence","HTTP hash")
+        assert (prediction["confidence"],prediction["expected_value"],prediction["information_gain"],prediction["uncertainty"])==(.8,2,2,.2)
+        ambiguous=next(o["action_id"] for o in episode["body"]["observations"] if o["decision_provenance_id"] is None)
+        assert not runtime.evaluate_outcome(OutcomeEvaluation(ambiguous,"OBJECTIVE_TEST",("test:ambiguous",),True,"pass",time.time(),"objective"))
+        try: runtime.evaluate_outcome(OutcomeEvaluation(observation_id,"Saphira-A",("self:claim",),True,"pass",time.time(),"self claim"))
+        except PermissionError: pass
+        else: raise AssertionError("colony self-verification was trusted")
+        memories={name:list(colony.memories) for name,colony in runtime.organism.colonies.items()}
+        provenance=next(p for p in runtime.embodiment_store.all("decision_provenance") if p["id"]==prediction["decision_provenance_id"])
+        assert runtime.evaluate_outcome(OutcomeEvaluation(observation_id,"OBJECTIVE_TEST",("human-evaluation:1",),True,"pass",time.time(),"objective result"))
         assert runtime.embodiment_store.all("digest")
-        assert sum(n.verified_contribution for c in runtime.organism.colonies.values() for n in c.neurons.values())==1
-        assert any(record.task_performance for record in runtime.records.values())
+        source=provenance["source_colony"]; other=next(name for name in runtime.organism.colonies if name!=source)
+        assert sum(n.verified_contribution for n in runtime.organism.colonies[source].neurons.values())>0
+        assert sum(n.verified_contribution for n in runtime.organism.colonies[other].neurons.values())==0
+        assert runtime.records[provenance["source_model_key"]].task_performance
+        assert runtime.operational_status()["current_step"]=="OUTCOME_VERIFIED"
+        assert not any(record.task_performance for key,record in runtime.records.items() if key!=provenance["source_model_key"])
+        assert {name:list(colony.memories) for name,colony in runtime.organism.colonies.items()}==memories
+        runtime.respond_to_digest(observation_id,other,DigestResponse.TEST_INDEPENDENTLY)
+        assert runtime.embodiment_store.all("borrowed_hypothesis")[-1]["verified"] is False
+        assert {name:list(colony.memories) for name,colony in runtime.organism.colonies.items()}==memories
         assert "cognitive outcome remains unverified" in episode["body"]["final_response"]
     finally: runtime.close(); server.shutdown(); worker.join(); server.server_close()
     restored=GodRuntime(tmp_path,providers,[ModelRecord("p","A"),ModelRecord("p","B")],secret="key",web_test_allow_hosts={"127.0.0.1"})
