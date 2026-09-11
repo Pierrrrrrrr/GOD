@@ -13,16 +13,17 @@ class BodyPlanningProvider:
         self.calls.append(request); prompt = request["prompt"]
         if "Assess only whether" in prompt: return {"material_disagreement": True, "reasons": ["method"]}
         if "separate sister-audit" in prompt: return {"disagreements":["method"],"synthesis":"use observed evidence","selected_next_action":"research","rationale":"bounded evidence"}
+        if "Respond to this SisterBrief" in prompt: return {"response":"CHALLENGE","reason":"retain alternative","updated_confidence":.7,"counterproposal":"verify independently","evidence_refs":[]}
         context = json.loads(prompt.split("JSON context:\n",1)[1]); goal = context.get("goal", "")
         perspective = request["model_id"]
         if "summarize" in goal.lower():
             demands = [
-              {"required_capability":"filesystem","intent":"read","inputs":{"path":"source.txt"},"expected_output":"text","expected_evidence":"file text","risk":0,"side_effect_class":"none","budget":1,"reversibility":True,"confidence":.9,"information_gain":.8,"filesystem_need":"workspace"},
-              {"required_capability":"filesystem","intent":"write","inputs":{"path":"source.summary.txt","content":"Summary: {evidence}"},"expected_output":"summary file","expected_evidence":"file hash","risk":0,"side_effect_class":"workspace","budget":1,"reversibility":True,"confidence":.9,"goal_value":3,"filesystem_need":"workspace"}]
+              {"required_capability":"filesystem","intent":"read","inputs":{"path":"source.txt"},"expected_output":"text","expected_evidence":"file text","risk":0,"side_effect_class":"none","budget":1,"reversibility":True,"confidence":.9,"goal_value":2,"information_gain":.8,"capability_gain":0,"uncertainty":.1,"network_need":"none","filesystem_need":"workspace"},
+              {"required_capability":"filesystem","intent":"write","inputs":{"path":"source.summary.txt","content":"Summary: {evidence}"},"expected_output":"summary file","expected_evidence":"file hash","risk":0,"side_effect_class":"workspace","budget":1,"reversibility":True,"confidence":.9,"goal_value":3,"information_gain":0,"capability_gain":0,"uncertainty":.1,"network_need":"none","filesystem_need":"workspace"}]
         else:
             demands = [
-              {"required_capability":"web","intent":"GET","inputs":{"url":self.url},"expected_output":"official evidence","expected_evidence":"HTTP hash","risk":0,"side_effect_class":"none","budget":1,"reversibility":True,"confidence":.8,"information_gain":2,"network_need":"public-http-test"},
-              {"required_capability":"filesystem","intent":"write","inputs":{"path":"report.txt","content":"Evidence: {evidence}"},"expected_output":"report file","expected_evidence":"file hash","risk":0,"side_effect_class":"workspace","budget":1,"reversibility":True,"confidence":.9,"goal_value":4,"filesystem_need":"workspace"}]
+              {"required_capability":"web","intent":"GET","inputs":{"url":self.url},"expected_output":"official evidence","expected_evidence":"HTTP hash","risk":0,"side_effect_class":"none","budget":1,"reversibility":True,"confidence":.8,"goal_value":2,"information_gain":2,"capability_gain":0,"uncertainty":.2,"network_need":"public-http-test","filesystem_need":"none"},
+              {"required_capability":"filesystem","intent":"write","inputs":{"path":"report.txt","content":"Evidence: {evidence}"},"expected_output":"report file","expected_evidence":"file hash","risk":0,"side_effect_class":"workspace","budget":1,"reversibility":True,"confidence":.9,"goal_value":4,"information_gain":0,"capability_gain":0,"uncertainty":.1,"network_need":"none","filesystem_need":"workspace"}]
         return {"desired_outcome":"saved evidence", "hypotheses":[perspective], "constraints":[], "unknowns":[],
                 "next_useful_action":"use body", "confidence":.8, "sister_response":"CHALLENGE", "body_demands":demands}
 
@@ -37,13 +38,30 @@ def test_real_godruntime_research_save_sister_digest_and_restart(tmp_path: Path)
     identities={k:v.id for k,v in runtime.organism.colonies.items()}; lineages={k:list(v.lineage) for k,v in runtime.organism.colonies.items()}
     try:
         episode=runtime.submit_goal("Research current protocol evidence and save a report")
+        prompts=[call["prompt"] for call in providers["p"].calls]
+        independent=[i for i,prompt in enumerate(prompts) if "Reason independently" in prompt]
+        post_index=next(i for i,prompt in enumerate(prompts) if "Respond to this SisterBrief" in prompt)
+        assert len(independent)==2 and max(independent)<post_index
+        assert "body_demands as a JSON list" in prompts[independent[0]]
+        assert all("sister_brief" not in prompts[index] and "independent_arguments" not in prompts[index] for index in independent)
+        post_context=json.loads(prompts[post_index].split("JSON context:\n",1)[1])
+        assert set(post_context)=={"goal","sister_brief"} and "independent_arguments" not in post_context
         assert episode["work_class"]=="DELIBERATIVE" and set(episode["interpretations"])=={"Saphira-A","Saphira-B"}
-        assert episode["exchange"]["round"]==1 and episode["body"]["status"]=="verified"
+        assert episode["exchange"]["round"]==1 and episode["exchange"]["post_brief_response"]["response"]=="CHALLENGE"
+        assert episode["body"]["status"]=="executed"
         report=(tmp_path/"workspace/report.txt"); assert report.exists() and "controlled official" in report.read_text()
         assert len(runtime.embodiment_store.all("prediction")) >= 4
         assert all(o["content_hash"] for o in runtime.embodiment_store.all("observation"))
+        assert not runtime.embodiment_store.all("digest")
+        assert sum(n.verified_contribution for c in runtime.organism.colonies.values() for n in c.neurons.values())==0
+        assert not any(record.task_performance for record in runtime.records.values())
+        assert runtime.body_bus.manifests["web-research"].verified_reliability > .8
+        observation_id=episode["body"]["observations"][0]["action_id"]
+        assert runtime.evaluate_outcome(observation_id,evidence_refs=("human-evaluation:1",),correct=True)
         assert runtime.embodiment_store.all("digest")
-        assert "Completed real body actions" in episode["body"]["final_response"]
+        assert sum(n.verified_contribution for c in runtime.organism.colonies.values() for n in c.neurons.values())==1
+        assert any(record.task_performance for record in runtime.records.values())
+        assert "cognitive outcome remains unverified" in episode["body"]["final_response"]
     finally: runtime.close(); server.shutdown(); worker.join(); server.server_close()
     restored=GodRuntime(tmp_path,providers,[ModelRecord("p","A"),ModelRecord("p","B")],secret="key",web_test_allow_hosts={"127.0.0.1"})
     assert {k:v.id for k,v in restored.organism.colonies.items()}==identities
@@ -59,7 +77,7 @@ def test_real_godruntime_workspace_summarize_and_save(tmp_path: Path):
     runtime=GodRuntime(tmp_path,{"p":provider},[ModelRecord("p","A"),ModelRecord("p","B")],secret="key")
     workspace=tmp_path/"workspace"; workspace.mkdir(exist_ok=True); (workspace/"source.txt").write_text("alpha beta gamma")
     episode=runtime.submit_goal("Read this workspace file, summarize it, and save the summary beside it")
-    assert episode["body"]["status"]=="verified"
+    assert episode["body"]["status"]=="executed"
     assert "alpha beta gamma" in (workspace/"source.summary.txt").read_text()
     runtime.close()
 

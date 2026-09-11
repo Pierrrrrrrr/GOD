@@ -28,7 +28,7 @@ def test_workspace_security_and_real_observation(tmp_path):
     result=loop.execute(demand); assert result.success and (tmp_path/"x.txt").read_text()=="real"
     assert store.all("prediction")[0]["created_at"] <= store.all("observation")[0]["started_at"]
     with pytest.raises(ValueError): loop.completion(None)
-    loop.verify(result,lambda o: Path(tmp_path/o.result["path"]).exists()); assert "verified" in loop.completion(result)
+    loop.verify(result,lambda o: Path(tmp_path/o.result["path"]).exists()); assert "observed" in loop.completion(result) and result.verification_state == "ARTIFACT_VERIFIED"
     store.close()
 
 

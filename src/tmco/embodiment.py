@@ -5,6 +5,7 @@ import hashlib, ipaddress, json, socket, sqlite3, time
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
+from enum import StrEnum
 from urllib.parse import urlparse
 from urllib.error import HTTPError
 from urllib.request import HTTPRedirectHandler, Request, build_opener
@@ -16,6 +17,29 @@ from .buses import BodyBus, OrganManifest, ProviderUnavailable
 class PermissionDenied(RuntimeError): pass
 class MCPUnavailable(ProviderUnavailable): pass
 class SandboxUnavailable(ProviderUnavailable): pass
+
+
+class VerificationLevel(StrEnum):
+    UNVERIFIED = "UNVERIFIED"
+    TRANSPORT_VERIFIED = "TRANSPORT_VERIFIED"
+    ARTIFACT_VERIFIED = "ARTIFACT_VERIFIED"
+    EVIDENCE_VERIFIED = "EVIDENCE_VERIFIED"
+    OUTCOME_VERIFIED = "OUTCOME_VERIFIED"
+
+
+class ExternalComponentTrust(StrEnum):
+    DISCOVERED = "DISCOVERED"; INSPECTED = "INSPECTED"; QUARANTINED = "QUARANTINED"
+    TESTED = "TESTED"; SISTER_AUDITED = "SISTER_AUDITED"; APPROVED = "APPROVED"; REJECTED = "REJECTED"
+
+
+@dataclass(slots=True)
+class ExternalComponentCandidate:
+    id: str; source_url: str; publisher: str; version_or_commit: str; license: str
+    provenance: str; maintenance_evidence: tuple[str, ...]; security_advisories: tuple[str, ...]
+    security_policy: str | None; dependencies: tuple[str, ...]; requested_permissions: tuple[str, ...]
+    filesystem_access: tuple[str, ...]; network_access: tuple[str, ...]; credential_requirements: tuple[str, ...]
+    sandbox_required: bool; test_results: tuple[str, ...]; risk_score: float
+    trust_state: ExternalComponentTrust = ExternalComponentTrust.DISCOVERED
 
 
 @dataclass(slots=True)
@@ -56,7 +80,7 @@ class ObservationEnvelope:
     started_at: float; finished_at: float; success: bool; result: Any
     evidence_refs: tuple[str, ...]; provenance: str; content_hash: str
     cost: float; latency_ms: float; side_effects: str
-    verification_state: str = "unverified"; error_class: str | None = None
+    verification_state: str = VerificationLevel.UNVERIFIED.value; error_class: str | None = None
     actual_outcome: str | None = None; prediction_error: str | None = None
 
 @dataclass(slots=True)
@@ -286,8 +310,10 @@ class ActionLoop:
                                           success, result, (f"sha256:{digest}",), organ.provenance, digest, organ.cost,
                                           (finished-started)*1000, organ.side_effect_class, error_class=error)
         self.store.put("observation", action_id, observation); return observation
-    def verify(self, observation: ObservationEnvelope, verifier: Any) -> bool:
-        verified = bool(observation.success and verifier(observation)); observation.verification_state = "verified" if verified else "rejected"
+    def verify(self, observation: ObservationEnvelope, verifier: Any,
+               level: VerificationLevel = VerificationLevel.ARTIFACT_VERIFIED) -> bool:
+        verified = bool(observation.success and verifier(observation))
+        observation.verification_state = level.value if verified else VerificationLevel.UNVERIFIED.value
         observation.actual_outcome = "success" if observation.success else "failure"
         prediction = next((p for p in self.store.all("prediction") if p["action_id"] == observation.action_id), None)
         observation.prediction_error = None if verified else f"expected {prediction['expected'] if prediction else 'success'}; observed {observation.actual_outcome}"
@@ -295,4 +321,5 @@ class ActionLoop:
     @staticmethod
     def completion(observation: ObservationEnvelope | None) -> str:
         if observation is None: raise ValueError("completion claim requires an ObservationEnvelope")
-        return "Action completed and verified." if observation.verification_state == "verified" else "An action was observed but is not verified."
+        return ("Action completed and observed." if observation.verification_state != VerificationLevel.UNVERIFIED.value
+                else "An action was observed but is not verified.")

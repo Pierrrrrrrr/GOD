@@ -12,7 +12,8 @@ from uuid import uuid4
 from .buses import BodyBus, ModelBus, ModelProvider, OrganManifest, ProviderUnavailable
 from .embodiment import (ActionLoop, CapabilityDemand, CapabilityResolver, EmbodimentStore,
                          HumanApprovalRequest, ObservationEnvelope, OrganRegistry,
-                         PermissionAuthority, WebResearchOrgan, WorkspaceFilesystemOrgan)
+                         PermissionAuthority, VerificationLevel, WebResearchOrgan,
+                         WorkspaceFilesystemOrgan)
 from .executive import Cognition
 from .models import ModelRecord, ModelRouter
 from .morphogenesis import AssemblyFormationPolicy
@@ -219,7 +220,13 @@ class GodRuntime:
                 answer = cognition.ask(
                     "Reason independently as this persistent colony. Infer desired_outcome, success_evidence, "
                     "constraints, unknowns, risks, subgoals, hypotheses, and next_useful_action. Do not assume "
-                    "the other colony's view.", {"colony": name, "identity": colony.id, "goal": text})
+                    "the other colony's view. If external information or action is needed, return body_demands as "
+                    "a JSON list whose every item contains required_capability, intent, inputs, expected_output, "
+                    "expected_evidence, risk, side_effect_class, budget, reversibility, confidence, goal_value, "
+                    "information_gain, capability_gain, uncertainty, network_need, and filesystem_need. Return an "
+                    "empty body_demands list when no body capability is needed. Describe WHAT is required only; "
+                    "never request shell or arbitrary code execution and never claim prose is an executed action.",
+                    {"colony": name, "identity": colony.id, "goal": text})
                 self.router.observe_call(record, True, (time.monotonic() - started) * 1000)
             except Exception:
                 self.router.observe_call(record, False, (time.monotonic() - started) * 1000)
@@ -252,7 +259,7 @@ class GodRuntime:
                 "against the goal, and return disagreements, synthesis, selected_next_action, and rationale.",
                 {"goal": text, "independent_arguments": interpretations})
             self.router.observe_call(record, True, (time.monotonic() - started) * 1000)
-        exchange = self._integrated_exchange(goal_id, interpretations, material_disagreement)
+        exchange = self._integrated_exchange(goal_id, text, interpretations, material_disagreement)
         episode = {"id": uuid4().hex, "goal_id": goal_id, "goal": text,
                    "interpretations": interpretations,
                    "candidate_disagreement": candidate_disagreement,
@@ -291,7 +298,7 @@ class GodRuntime:
             return (relevance*2 + verified + confidence + novelty + borrowed - cost*.1, name)
         return max(self.organism.colonies.items(), key=score)
 
-    def _integrated_exchange(self, goal_id: str, interpretations: dict[str, dict[str, Any]], triggered: bool) -> dict[str, Any] | None:
+    def _integrated_exchange(self, goal_id: str, goal: str, interpretations: dict[str, dict[str, Any]], triggered: bool) -> dict[str, Any] | None:
         if not triggered or len(interpretations) < 2: return None
         names = list(interpretations); source, target = names[0], names[1]
         argument = interpretations[source]["argument"]
@@ -300,13 +307,21 @@ class GodRuntime:
                             tuple(map(str, argument.get("critical_assumptions", argument.get("constraints", ())))),
                             tuple(map(str, argument.get("unknowns", ()))), tuple(map(str, argument.get("capability_gaps", ()))),
                             str(argument.get("prediction", "")))
-        target_view = SisterView(target, {})
-        response_name = str(interpretations[target]["argument"].get("sister_response", "CHALLENGE")).upper()
+        # This is a genuinely new post-brief turn. It contains the compact brief and
+        # goal only—not the source interpretation, private memory, or topology.
+        target_record = self.records[interpretations[target]["model"]]
+        post = ModelBackedCognition(self.bus, target_record).ask(
+            "Respond to this SisterBrief after your independent first pass. Return response as exactly ACCEPT, "
+            "CHALLENGE, IGNORE, or COUNTERPROPOSE, plus reason, updated_confidence, optional counterproposal, "
+            "and evidence_refs.", {"goal": goal, "sister_brief": asdict(brief)})
+        response_name = str(post.get("response", "IGNORE")).upper()
         response = BriefResponse(response_name) if response_name in BriefResponse.__members__ else BriefResponse.CHALLENGE
+        target_view = SisterView(target, {})
         if not self.sister_exchange.exchange(goal_id, SisterView(source, {}), target_view, brief, response,
-                                             trigger="material_disagreement", counterproposal=str(interpretations[target]["argument"].get("hypotheses", [""])[0])): return None
+                                             trigger="material_disagreement", counterproposal=str(post.get("counterproposal") or interpretations[target]["argument"].get("hypotheses", [""])[0])): return None
         event = {"goal_id": goal_id, "round": self.sister_exchange.rounds[goal_id], "source": source, "target": target,
-                 "brief": asdict(brief), "response": response.value, "minority_hypotheses": target_view.minority_hypotheses}
+                 "brief": asdict(brief), "response": response.value, "post_brief_response": post,
+                 "minority_hypotheses": target_view.minority_hypotheses}
         self.embodiment_store.put("exchange", f"{goal_id}:{event['round']}", event); return event
 
     def _structured_demands(self, goal_id: str, task: str, interpretations: dict[str, dict[str, Any]]) -> list[tuple[float, CapabilityDemand, dict[str, Any]]]:
@@ -315,8 +330,10 @@ class GodRuntime:
             plans = view["argument"].get("body_demands", [])
             if isinstance(view["argument"].get("body_demand"), dict): plans = [view["argument"]["body_demand"]]
             for data in plans:
-                required = {"required_capability","intent","inputs","expected_output","expected_evidence","risk","side_effect_class","budget","reversibility","confidence"}
+                required = {"required_capability","intent","inputs","expected_output","expected_evidence","risk","side_effect_class","budget","reversibility","confidence","goal_value","information_gain","capability_gain","uncertainty","network_need","filesystem_need"}
                 if not isinstance(data, dict) or not required <= set(data): raise ValueError("invalid structured body demand")
+                if str(data["required_capability"]).lower() in {"shell", "code", "subprocess"}:
+                    raise ValueError("arbitrary shell/code body demands are forbidden")
                 demand = CapabilityDemand(goal_id, task, str(data["required_capability"]), str(data["intent"]), dict(data["inputs"]),
                     str(data["expected_evidence"]), float(data["risk"]), str(data["side_effect_class"]),
                     str(data.get("network_need", "none")), str(data.get("filesystem_need", "none")),
@@ -342,7 +359,11 @@ class GodRuntime:
             result = self.action_loop.execute(demand)
             if isinstance(result, HumanApprovalRequest): state.update(current_step="pending_approval", pending_approval=result.id); self.store.put("goals",state["id"],state); return {"status":"pending_approval","request":asdict(result)}
             if not isinstance(result, ObservationEnvelope): state.update(current_step="capability_gap"); self.store.put("goals",state["id"],state); return {"status":"gap"}
-            verified = self.action_loop.verify(result, lambda obs: obs.success and bool(obs.content_hash))
+            level = VerificationLevel.TRANSPORT_VERIFIED if demand.required_capability == "web" else VerificationLevel.ARTIFACT_VERIFIED
+            verified = self.action_loop.verify(result, lambda obs: obs.success and bool(obs.content_hash), level)
+            if verified:
+                manifest = self.body_bus.manifests[result.organ]
+                manifest.verified_reliability = min(1, manifest.verified_reliability + .01)
             observations.append(asdict(result)); state["last_observation"] = result.action_id
             if verified and demand.required_capability == "filesystem" and demand.intent in {"write", "append"}:
                 for check in ("exists", "hash"):
@@ -351,23 +372,36 @@ class GodRuntime:
                         filesystem_need="workspace", budget=demand.budget)
                     checked = self.action_loop.execute(verification)
                     if isinstance(checked, ObservationEnvelope):
-                        self.action_loop.verify(checked, lambda obs: obs.success and bool(obs.result.get("exists", obs.result.get("sha256"))))
+                        self.action_loop.verify(checked, lambda obs: obs.success and bool(obs.result.get("exists", obs.result.get("sha256"))), VerificationLevel.ARTIFACT_VERIFIED)
                         observations.append(asdict(checked)); state["last_observation"] = checked.action_id
             if verified:
                 evidence = result.result.get("text", json.dumps(result.result)) if isinstance(result.result, dict) else str(result.result)
-                primary_name, primary = self._dynamic_primary(state["description"]); lead = max(primary.neurons.values(), key=lambda n:n.confidence)
-                lead.verified_contribution += 1
-                digest = SisterDevelopmentDigest(primary_name,(demand.intent,),(),lead.specialization,demand.required_capability,
-                    "prefer verified organ",f"verify {demand.expected_output}",(result.action_id,),True)
-                other = next(name for name in self.organism.colonies if name != primary_name)
-                self.embodiment_store.put("digest", result.action_id, {**asdict(digest),"target":other,"response":"TEST_INDEPENDENTLY"})
-                self.organism.colonies[other].memories.append("borrowed-tested:"+digest.strategy_lesson)
             state["current_step"] = "verified" if verified else "replan"; self.store.put("goals",state["id"],state)
         state["status"] = "verified"; state["current_step"] = "complete"; self.store.put("goals",state["id"],state)
-        self.organism.memory.world_model["last_body_outcome"] = {"observations": observations, "verified": True}
-        self.organism._commit_state("verified_body_outcome")
-        return {"status":"verified", "observations":observations,
-                "final_response":"Completed real body actions; persisted and verified their observations."}
+        self.organism.memory.world_model["last_body_outcome"] = {"observations": observations,
+            "verification_level": VerificationLevel.ARTIFACT_VERIFIED.value}
+        self.organism._commit_state("observed_body_execution")
+        return {"status":"executed", "observations":observations,
+                "final_response":"Completed real body actions and verified their transport/artifacts; cognitive outcome remains unverified."}
+
+    def evaluate_outcome(self, observation_id: str, *, evidence_refs: tuple[str, ...],
+                         correct: bool, task: str = "goal_reasoning") -> bool:
+        """External/evaluable outcome gate; transport success alone cannot call this."""
+        if not evidence_refs: raise ValueError("outcome verification requires real evidence references")
+        data = next(o for o in self.embodiment_store.all("observation") if o["action_id"] == observation_id)
+        observation = ObservationEnvelope(**{**data, "evidence_refs": tuple(data["evidence_refs"])})
+        if not correct: return self.action_loop.verify(observation, lambda _: False, VerificationLevel.OUTCOME_VERIFIED)
+        self.action_loop.verify(observation, lambda _: True, VerificationLevel.OUTCOME_VERIFIED)
+        primary_name, primary = self._dynamic_primary(observation.task)
+        lead = max(primary.neurons.values(), key=lambda n:n.confidence); lead.verified_contribution += 1
+        record = next(iter(self.records.values()), None)
+        if record is not None: self.router.observe_verified_outcome(record, task, True)
+        digest = SisterDevelopmentDigest(primary_name,(observation.operation,),(),lead.specialization,None,
+            "route by outcome evidence", "retain outcome-verified strategy", evidence_refs, True)
+        other = next(name for name in self.organism.colonies if name != primary_name)
+        self.embodiment_store.put("digest", observation_id, {**asdict(digest),"target":other,"response":"TEST_INDEPENDENTLY"})
+        self.organism.colonies[other].memories.append("borrowed-tested:"+digest.strategy_lesson)
+        self.organism._commit_state("outcome_verified_learning"); self._save_models(); return True
 
     def _best_colony(self, decisions: list[Any]) -> tuple[str, Any]:
         name = decisions[0].colony_name
