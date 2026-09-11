@@ -1,122 +1,152 @@
-"""Root-owned, exact and single-use leases for future external setup.
-
-This module deliberately does not perform browser automation or create accounts.  It
-is the authority boundary that a future Capability Forge executor must cross.
-"""
+"""Persistent root-authorized leases for resumable external setup workflows."""
 from __future__ import annotations
 
 import hashlib
 import json
+import sqlite3
 import time
 from dataclasses import asdict, dataclass
-from enum import Enum
-from typing import Any, Callable
+from enum import StrEnum
+from pathlib import Path
+from typing import Callable
 from uuid import uuid4
 
 from .root import AuthorizationError, RootKernel
 
 
-class SetupState(str, Enum):
-    AWAITING_PIER = "AWAITING_PIER"
-    AUTHORIZED = "AUTHORIZED"
-    RUNNING = "RUNNING"
-    PAUSED_FOR_PIER = "PAUSED_FOR_PIER"
-    COMPLETE = "COMPLETE"
-    DENIED = "DENIED"
+class SetupState(StrEnum):
+    AWAITING_PIER = "AWAITING_PIER"; AUTHORIZED = "AUTHORIZED"; RUNNING = "RUNNING"
+    PAUSED_FOR_PIER = "PAUSED_FOR_PIER"; COMPLETE = "COMPLETE"; DENIED = "DENIED"
 
 
-class HumanCheckpoint(str, Enum):
-    CAPTCHA = "CAPTCHA"
-    MFA = "MFA"
-    IDENTITY_VERIFICATION = "IDENTITY_VERIFICATION"
-    UNEXPECTED_PAYMENT = "UNEXPECTED_PAYMENT"
-    UNEXPECTED_PERMISSION = "UNEXPECTED_PERMISSION"
+class HumanCheckpoint(StrEnum):
+    CAPTCHA = "CAPTCHA"; MFA = "MFA"; IDENTITY_VERIFICATION = "IDENTITY_VERIFICATION"
+    UNEXPECTED_PAYMENT = "UNEXPECTED_PAYMENT"; UNEXPECTED_PERMISSION = "UNEXPECTED_PERMISSION"
     LEGAL_CONFIRMATION = "LEGAL_CONFIRMATION"
 
 
 @dataclass(frozen=True, slots=True)
 class CapabilityRequest:
-    owner: str
-    service: str
-    operation: str
-    purpose: str
-    workflow_id: str
-    credential_type: str
-    scopes: tuple[str, ...] = ()
-    allowed_submitted_data: tuple[str, ...] = ()
-    maximum_cost: float = 0.0
-    allowed_side_effects: tuple[str, ...] = ()
-    ttl_seconds: int = 900
-    non_delegable: bool = True
+    owner: str; service: str; operation: str; purpose: str; workflow_id: str
+    executor_principal: str; credential_type: str; account_id: str
+    scopes: tuple[str, ...] = (); allowed_submitted_data: tuple[str, ...] = ()
+    maximum_cost: float = 0; allowed_side_effects: tuple[str, ...] = ()
+    ttl_seconds: int = 900; non_delegable: bool = True
 
 
 @dataclass(frozen=True, slots=True)
 class OwnerCapability:
-    request: CapabilityRequest
-    expires_at: float
-    nonce: str
-    signature: str
+    request_id: str; request: CapabilityRequest; expires_at: float; nonce: str; signature: str
+
+
+class OwnerApproval:
+    """Opaque proof minted by the authority-bound host control surface."""
+    __slots__ = ("request_id", "approved", "__token")
+    def __init__(self, request_id: str, approved: bool, token: object, expected: object):
+        if token is not expected: raise AuthorizationError("approval requires host owner control")
+        self.request_id, self.approved, self.__token = request_id, approved, token
+
+
+class OwnerControlSurface:
+    """Host UI adapter; never passed to cognition or workflow executors."""
+    __slots__ = ("__token",)
+    def __init__(self, token: object): self.__token = token
+    def decide(self, request_id: str, approved: bool) -> OwnerApproval:
+        return OwnerApproval(request_id, approved, self.__token, self.__token)
+
+
+class CapabilityRequester:
+    """Narrow interface safe to provide to cognition/body components."""
+    __slots__ = ("__request",)
+    def __init__(self, request: Callable[[CapabilityRequest], str]): self.__request = request
+    def request(self, request: CapabilityRequest) -> str: return self.__request(request)
 
 
 class OwnerCapabilityAuthority:
-    """Issues and consumes leases; callers receive no signing primitive."""
+    def __init__(self, root: RootKernel, path: Path, now: Callable[[], float] = time.time):
+        self.__root, self.__now = root, now
+        self.__host_token = object()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        self.__db = sqlite3.connect(path)
+        self.__db.execute("CREATE TABLE IF NOT EXISTS owner_capabilities(request_id TEXT PRIMARY KEY,state TEXT NOT NULL)")
+        self.__db.commit()
 
-    def __init__(self, root: RootKernel, now: Callable[[], float] = time.time):
-        self.__root = root
-        self.__now = now
-        self.__used: set[str] = set()
-        self.states: dict[str, SetupState] = {}
-        self.__requests: dict[str, CapabilityRequest] = {}
+    def requester(self) -> CapabilityRequester: return CapabilityRequester(self.request)
+    def owner_control(self) -> OwnerControlSurface: return OwnerControlSurface(self.__host_token)
 
     @staticmethod
-    def _payload(request: CapabilityRequest, expires_at: float, nonce: str) -> bytes:
-        return json.dumps({"request": asdict(request), "expires_at": expires_at, "nonce": nonce},
-                          sort_keys=True, separators=(",", ":")).encode()
+    def _request(data: dict) -> CapabilityRequest:
+        for key in ("scopes", "allowed_submitted_data", "allowed_side_effects"):
+            data[key] = tuple(data.get(key, ()))
+        return CapabilityRequest(**data)
+
+    @staticmethod
+    def _payload(request_id: str, request: CapabilityRequest, expiry: float, nonce: str) -> bytes:
+        return json.dumps({"request_id": request_id, "request": asdict(request), "expires_at": expiry,
+                           "nonce": nonce}, sort_keys=True, separators=(",", ":")).encode()
+
+    def _get(self, request_id: str) -> dict:
+        row = self.__db.execute("SELECT state FROM owner_capabilities WHERE request_id=?", (request_id,)).fetchone()
+        if not row: raise KeyError(request_id)
+        return json.loads(row[0])
+
+    def _put(self, request_id: str, state: dict) -> None:
+        self.__db.execute("INSERT OR REPLACE INTO owner_capabilities VALUES(?,?)",
+                          (request_id, json.dumps(state, sort_keys=True))); self.__db.commit()
 
     def request(self, request: CapabilityRequest) -> str:
-        if not request.non_delegable or request.owner != self.__root.owner:
-            raise AuthorizationError("owner capability must be owner-bound and non-delegable")
-        request_id = hashlib.sha256(json.dumps(asdict(request), sort_keys=True).encode()
-                                    + uuid4().bytes).hexdigest()
-        self.states[request_id] = SetupState.AWAITING_PIER
-        self.__requests[request_id] = request
+        if request.owner != self.__root.owner or not request.non_delegable or not request.executor_principal:
+            raise AuthorizationError("request must be owner-bound, executor-bound, and non-delegable")
+        request_id = uuid4().hex
+        self._put(request_id, {"request": asdict(request), "status": SetupState.AWAITING_PIER,
+                               "checkpoint": None, "capability": None, "nonce_hash": None,
+                               "consumed": False, "revoked": False})
         self.__root.record("owner_capability_requested", {"request_id": request_id,
                            "service": request.service, "operation": request.operation})
         return request_id
 
-    def grant(self, request_id: str, request: CapabilityRequest, *, actor: str) -> OwnerCapability:
-        if (actor != self.__root.owner or self.states.get(request_id) != SetupState.AWAITING_PIER
-                or self.__requests.get(request_id) != request):
-            raise AuthorizationError("a fresh Pier approval is required")
-        expiry, nonce = self.__now() + request.ttl_seconds, uuid4().hex
-        signature = self.__root._guard.sign(self._payload(request, expiry, nonce))
-        capability = OwnerCapability(request, expiry, nonce, signature)
-        self.states[request_id] = SetupState.AUTHORIZED
-        self.__root.record("owner_capability_granted", {"request_id": request_id,
-                           "service": request.service, "nonce_hash": hashlib.sha256(nonce.encode()).hexdigest()})
-        return capability
+    def decide(self, approval: OwnerApproval) -> OwnerCapability | None:
+        if getattr(approval, "_OwnerApproval__token", None) is not self.__host_token:
+            raise AuthorizationError("approval is not bound to this host authority")
+        state = self._get(approval.request_id)
+        if state["status"] != SetupState.AWAITING_PIER: raise AuthorizationError("fresh approval required")
+        if not approval.approved:
+            state["status"], state["revoked"] = SetupState.DENIED, True; self._put(approval.request_id, state); return None
+        request = self._request(state["request"]); expiry, nonce = self.__now()+request.ttl_seconds, uuid4().hex
+        signature = self.__root.sign_owner_capability(self._payload(approval.request_id, request, expiry, nonce))
+        capability = OwnerCapability(approval.request_id, request, expiry, nonce, signature)
+        state.update(status=SetupState.AUTHORIZED, capability={**asdict(capability), "request": asdict(request)},
+                     nonce_hash=hashlib.sha256(nonce.encode()).hexdigest())
+        self._put(approval.request_id, state); return capability
 
-    def consume(self, capability: OwnerCapability, actual: CapabilityRequest, *, actor: str) -> None:
-        if actor != capability.request.owner or actor != self.__root.owner:
-            raise AuthorizationError("owner capability is non-delegable")
-        if capability.nonce in self.__used:
-            raise AuthorizationError("owner capability has already been used")
-        if self.__now() >= capability.expires_at:
-            raise AuthorizationError("owner capability has expired")
-        if actual != capability.request:
-            raise AuthorizationError("workflow differs from the approved capability")
-        if not self.__root._guard.verify(self._payload(capability.request, capability.expires_at,
-                                                       capability.nonce), capability.signature):
+    def capability(self, request_id: str) -> OwnerCapability:
+        state = self._get(request_id); data = state.get("capability")
+        if not data: raise AuthorizationError("workflow is not authorized")
+        data["request"] = self._request(data["request"]); return OwnerCapability(**data)
+
+    def consume(self, capability: OwnerCapability, actual: CapabilityRequest, *, executor_principal: str) -> None:
+        state = self._get(capability.request_id)
+        if state["consumed"]: raise AuthorizationError("owner capability has already been used")
+        if state["revoked"] or state["status"] != SetupState.AUTHORIZED: raise AuthorizationError("workflow is not authorized")
+        if executor_principal != capability.request.executor_principal: raise AuthorizationError("wrong workflow executor")
+        if actual != capability.request: raise AuthorizationError("workflow differs from approved capability")
+        if self.__now() >= capability.expires_at: raise AuthorizationError("owner capability has expired")
+        if hashlib.sha256(capability.nonce.encode()).hexdigest() != state["nonce_hash"] or not \
+                self.__root.verify_owner_capability(self._payload(capability.request_id, capability.request,
+                    capability.expires_at, capability.nonce), capability.signature):
             raise AuthorizationError("owner capability signature is invalid")
-        # Burn before handing control to an executor: even a failed attempt needs new approval.
-        self.__used.add(capability.nonce)
-        self.__root.record("owner_capability_consumed", {
-            "service": actual.service, "operation": actual.operation,
-            "nonce_hash": hashlib.sha256(capability.nonce.encode()).hexdigest()})
+        state.update(consumed=True, status=SetupState.COMPLETE); self._put(capability.request_id, state)
 
     def pause(self, request_id: str, checkpoint: HumanCheckpoint) -> None:
-        if request_id not in self.states:
-            raise KeyError(request_id)
-        self.states[request_id] = SetupState.PAUSED_FOR_PIER
-        self.__root.record("external_setup_paused", {"request_id": request_id,
-                                                     "checkpoint": checkpoint.value})
+        state = self._get(request_id)
+        if state["status"] not in {SetupState.AUTHORIZED, SetupState.RUNNING}: raise AuthorizationError("workflow cannot pause")
+        state.update(status=SetupState.PAUSED_FOR_PIER, checkpoint=checkpoint); self._put(request_id, state)
+
+    def resume(self, approval: OwnerApproval, actual: CapabilityRequest) -> None:
+        state = self._get(approval.request_id)
+        if not approval.approved or state["status"] != SetupState.PAUSED_FOR_PIER or self._request(state["request"]) != actual:
+            raise AuthorizationError("checkpoint resume must match the exact approved workflow")
+        state.update(status=SetupState.AUTHORIZED, checkpoint=None); self._put(approval.request_id, state)
+
+    def status(self, request_id: str) -> SetupState: return SetupState(self._get(request_id)["status"])
+    def close(self) -> None: self.__db.commit(); self.__db.close()

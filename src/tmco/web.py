@@ -8,6 +8,8 @@ import sqlite3
 import threading
 import time
 import webbrowser
+import queue
+from uuid import uuid4
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs
@@ -18,18 +20,21 @@ from .connectors import (GeminiConnector, OllamaConnector, OpenAICompatibleConne
 from .models import HTTPModelProvider, ModelRecord, ModelRouter
 from .vault import CredentialHandle, CredentialVault
 
+PROVIDER_STATES = {"CONNECTED", "INVALID_CREDENTIAL", "UNAVAILABLE", "RECONNECT_REQUIRED", "NOT_CONFIGURED"}
+
 
 PAGE = """<!doctype html><html><head><meta charset=utf-8><title>G.O.D. Observatory</title>
 <style>:root{color-scheme:dark}body{font:14px system-ui;margin:0;background:#0b0f17;color:#e8edf8}header{display:flex;gap:1.3rem;padding:1rem 2rem;background:#141b28;border-bottom:1px solid #33415c;position:sticky;top:0}.ok{color:#75e0a7}.off{color:#ffbc70}.grid{display:grid;grid-template-columns:1fr 2fr 1.25fr;gap:1rem;padding:1rem}.panel,fieldset{background:#121925;border:1px solid #2c3952;border-radius:8px;padding:1rem}input,select,button{padding:.65rem;margin:.25rem;background:#202b3e;color:#fff;border:1px solid #526582;border-radius:4px}input[name=message]{width:70%}#chat{white-space:pre-wrap;min-height:20rem}.timeline{max-height:65vh;overflow:auto}.event{border-left:2px solid #709cf5;padding:.35rem .65rem;margin:.5rem 0}.offline{text-align:center;border-color:#b27a3e}.offline h2{letter-spacing:.12em}.summary{margin:.6rem 0;padding:.6rem;background:#192234}a{color:#8fb5ff}@media(max-width:900px){.grid{grid-template-columns:1fr}}</style></head>
 <body><header>{header}</header><main>{onboarding}<div class=grid><section class=panel><h2>Current task</h2>{status}{approval}</section>
 <section class=panel><h2>Owner conversation</h2><div id=chat>{chat}</div><form method=post action=/chat><input name=message autofocus placeholder="Find a realistic way to achieve X" required><button>Send</button></form><h3>Safe sister summaries</h3>{sisters}</section>
-<aside class="panel timeline"><h2>Live activity</h2>{timeline}</aside></div>
+<aside class="panel timeline"><h2>Live activity</h2><div id=events>{timeline}</div></aside></div>
 <fieldset><legend>Intelligence controls</legend><form method=post action=/local><button>DETECT LOCAL MODELS</button></form>
 <form method=post action=/policy><label>Routing <select name=policy><option>AUTO</option><option value=FREE_FIRST>FREE FIRST</option><option value=LOCAL_FIRST>LOCAL FIRST</option></select></label><button>Apply</button></form>
 <details><summary>Advanced: secrets file, custom endpoint, manual provider/model IDs</summary><form method=post action=/import><input name=path placeholder="secrets.json path" required><label><input type=checkbox name=delete value=yes>Delete source after secure import</label><button>IMPORT</button></form><form method=post action=/connect>
 <select name=provider><option>OpenRouter</option><option>Gemini</option><option>OpenAI-compatible</option></select>
 <input name=model placeholder="model id" required><input name=endpoint placeholder="compatible endpoint">
-<input type=password name=key placeholder="API key" autocomplete=off required><button>Connect manually</button></form></details></fieldset></main></body></html>"""
+<input type=password name=key placeholder="API key" autocomplete=off required><button>Connect manually</button></form></details></fieldset></main>
+<script>setInterval(async()=>{const r=await fetch('/api/status',{cache:'no-store'});if(!r.ok)return;const s=await r.json();document.querySelector('#events').innerHTML=s.timeline.slice().reverse().map(e=>`<div class=event><b>${e.kind}</b><br>${e.summary}</div>`).join('')},750)</script></body></html>"""
 
 
 class App:
@@ -39,6 +44,7 @@ class App:
         self.runtime = GodRuntime(data)
         self.connectors: dict[str, ProviderConnector] = {}
         self.discovered: dict[str, ModelRecord] = {}
+        self.provider_states = {name: "NOT_CONFIGURED" for name in ("openrouter", "gemini", "ollama")}
         self.transcript: list[str] = []
         self._connect_stored_credentials()
         # Local discovery is safe and credential-free. Absence is an ordinary
@@ -64,8 +70,10 @@ class App:
             try:
                 connector = self._connector(handle)
                 if connector is not None:
-                    self._add_connector(connector)
+                    count = self._add_connector(connector)
+                    self.provider_states[handle.provider] = "CONNECTED" if count else "RECONNECT_REQUIRED"
             except Exception:
+                self.provider_states[handle.provider] = "RECONNECT_REQUIRED"
                 continue
         self._apply_connectors()
 
@@ -76,6 +84,7 @@ class App:
         preferred = next((r for r in records if r.model_id == "openrouter/free"), records[0])
         connector.probe(preferred.model_id)
         self.connectors[connector.name] = connector
+        self.provider_states[connector.name] = "CONNECTED"
         self.discovered.update((record.key, record) for record in records)
         return len(records)
 
@@ -83,7 +92,7 @@ class App:
         if self.connectors and self.discovered:
             self.runtime.attach_intelligence(self.connectors, list(self.discovered.values()))
 
-    def import_secrets(self, path: str, *, delete_source: bool = False) -> int:
+    def import_secrets(self, path: str, delete_source: bool = False) -> int:
         handles = self.vault.import_file(Path(path), delete_source=delete_source)
         count = 0
         for handle in handles:
@@ -103,6 +112,18 @@ class App:
         connector.probe(preferred.model_id)
         self.vault.set_provider("openrouter", api_key)
         self.connectors[connector.name] = connector
+        self.discovered.update((record.key, record) for record in records)
+        self._apply_connectors()
+        return len(records)
+
+    def connect_gemini(self, api_key: str) -> int:
+        connector = GeminiConnector(api_key)
+        records = connector.discover()
+        if not records: raise RuntimeError("provider catalog is unavailable")
+        connector.probe(records[0].model_id)
+        self.vault.set_provider("gemini", api_key)
+        self.connectors[connector.name] = connector
+        self.provider_states["gemini"] = "CONNECTED"
         self.discovered.update((record.key, record) for record in records)
         self._apply_connectors()
         return len(records)
@@ -153,6 +174,7 @@ class App:
         self._connect(values)
         provider = "gemini" if values["provider"] == "Gemini" else "openrouter"
         self.vault.set_provider(provider, values["key"])
+        self.provider_states[provider] = "CONNECTED"
         return "Connected. The credential is protected and is not displayed."
 
     @staticmethod
@@ -181,6 +203,7 @@ class App:
                      f"Intelligence {intelligence}"]
         lines.append(f"Discovered providers: {len(self.runtime.bus.providers)}; models: {len(self.runtime.records)}")
         lines.append(f"Routing: {self.runtime.routing_policy}")
+        lines.extend(f"{name.title()} — {status}" for name, status in self.provider_states.items())
         state = self.runtime.operational_status(); show = lambda value: "none" if value is None or value == [] else str(value)
         lines.extend((f"Current goal: {show(state['current_goal'])}", f"Current step: {state['current_step']}",
                       f"Work class: {show(state['work_class'])}", f"Current body organ: {show(state['current_organ'])}",
@@ -200,15 +223,19 @@ class App:
         return '''<section class="panel offline"><h2>INTELLIGENCE OFFLINE</h2><p>Recommended gateway: OpenRouter</p>
         <p><a href="https://openrouter.ai/keys" target="_blank" rel="noopener noreferrer">GET API KEY</a>
         · <a href="https://aistudio.google.com/apikey" target="_blank" rel="noopener noreferrer">Gemini / Google AI Studio</a></p>
-        <form method=post action=/openrouter><input type=password name=key aria-label="secure key input" placeholder="secure key input" autocomplete=off required><button>CONNECT</button></form></section>'''
+        <form method=post action=/openrouter><b>OPENROUTER</b> <input type=password name=key aria-label="OpenRouter secure key input" placeholder="paste key" autocomplete=off required><button>CONNECT</button></form>
+        <form method=post action=/gemini><b>GEMINI</b> <input type=password name=key aria-label="Gemini secure key input" placeholder="paste key" autocomplete=off required><button>CONNECT</button></form></section>'''
 
     def observatory(self) -> dict[str, str]:
         state = self.runtime.operational_status()
         healthy = self.runtime.organism.root.verify_audit()
+        manifests = self.runtime.body_bus.manifests
+        available = {manifest.kind for manifest in manifests.values() if manifest.available and manifest.trusted}
+        body_health = "READY" if {"filesystem", "web"} <= available else ("DEGRADED" if available else "NO_EXTERNAL_BODY")
         header = " · ".join((f"Root <b class=ok>{'SECURE' if healthy else 'FAULT'}</b>",
             "Saphira-A <b class=ok>ONLINE</b>", "Saphira-B <b class=ok>ONLINE</b>",
             f"Intelligence <b class={'ok' if self.runtime.intelligence_connected else 'off'}>{'ONLINE' if self.runtime.intelligence_connected else 'OFFLINE'}</b>",
-            "Body health <b class=ok>READY</b>"))
+            f"Body health <b class={'ok' if body_health == 'READY' else 'off'}>{body_health}</b>"))
         sister_cards = []
         for name, summary in state["sisters"].items():
             safe = " · ".join(f"{html.escape(str(k))}: {html.escape(str(v if v is not None else 'none'))}"
@@ -228,45 +255,116 @@ class App:
     def chat(self, message: str) -> str:
         return self.runtime.chat(message)
 
+    def set_policy(self, policy: str) -> str:
+        self.runtime.set_routing_policy(policy); return self.runtime.routing_policy
+
+    def decide_approval(self, request_id: str, approved: bool) -> None:
+        self.runtime.decide_approval(request_id, approved)
+
     def close(self) -> None:
         self.runtime.close()
 
 
+class RuntimeWorker:
+    """Owns App, GodRuntime, and every writable SQLite connection on one thread."""
+    def __init__(self, data: Path):
+        self.data, self.jobs = data, queue.Queue()
+        self.ready = threading.Event(); self.app: App | None = None
+        self.thread = threading.Thread(target=self._run, name="god-runtime-owner")
+        self.thread.start(); self.ready.wait()
+
+    def _run(self) -> None:
+        self.app = App(self.data); self.ready.set()
+        while True:
+            job_id, operation, arguments, reply = self.jobs.get()
+            if operation == "stop":
+                self.app.close(); reply.put(None); return
+            try: reply.put((True, getattr(self.app, operation)(*arguments)))
+            except Exception as error: reply.put((False, type(error).__name__))
+
+    def submit(self, operation: str, *arguments: object) -> tuple[str, queue.Queue]:
+        identity, reply = uuid4().hex, queue.Queue(maxsize=1)
+        self.jobs.put((identity, operation, arguments, reply)); return identity, reply
+
+    def call(self, operation: str, *arguments: object) -> object:
+        _, reply = self.submit(operation, *arguments); success, result = reply.get()
+        if not success: raise RuntimeError(str(result))
+        return result
+
+    def close(self) -> None:
+        reply = queue.Queue(maxsize=1); self.jobs.put(("shutdown", "stop", (), reply)); reply.get(); self.thread.join()
+
+
+def read_safe_snapshot(data: Path) -> dict[str, object]:
+    """Read WAL snapshots without touching the runtime owner's connections."""
+    database = data / "awakening.sqlite3"
+    if not database.exists(): return {"timeline": [], "sisters": {}, "selection": None}
+    connection = sqlite3.connect(f"file:{database}?mode=ro", uri=True)
+    connection.row_factory = sqlite3.Row
+    try:
+        events = [dict(row) for row in connection.execute(
+            "SELECT sequence,kind,summary,created FROM runtime_events ORDER BY sequence DESC LIMIT 50")]
+        sisters = {}
+        for name in ("Saphira-A", "Saphira-B"):
+            row = connection.execute("SELECT status,summary,confidence,created FROM sister_states WHERE colony=? "
+                                     "ORDER BY sequence DESC LIMIT 1", (name,)).fetchone()
+            sisters[name] = dict(row) if row else None
+        selected = connection.execute("SELECT goal_id,episode_id,task_class,colony,provider,model_id,routing_policy,"
+                                      "routing_reason,started_at,finished_at,latency_ms,success FROM model_selections "
+                                      "ORDER BY started_at DESC LIMIT 1").fetchone()
+        return {"timeline": events, "sisters": sisters, "selection": dict(selected) if selected else None}
+    finally: connection.close()
+
+
 def serve(data: Path, port: int, *, open_browser: bool = True) -> None:
-    app = App(data)
+    worker = RuntimeWorker(data)
     class Handler(BaseHTTPRequestHandler):
         def page(self) -> None:
-            view = app.observatory()
-            body = (PAGE.replace("{header}", view["header"]).replace("{onboarding}", app.onboarding())
-                    .replace("{status}", app.status()).replace("{approval}", app.approval())
+            app = worker.app; assert app is not None
+            view = worker.call("observatory")
+            body = (PAGE.replace("{header}", view["header"]).replace("{onboarding}", worker.call("onboarding"))
+                    .replace("{status}", worker.call("status")).replace("{approval}", worker.call("approval"))
                     .replace("{sisters}", view["sisters"]).replace("{timeline}", view["timeline"])
                     .replace("{chat}", html.escape("\n".join(app.transcript)))).encode()
             self.send_response(200); self.send_header("Content-Type", "text/html; charset=utf-8")
             self.send_header("Content-Length", str(len(body))); self.end_headers(); self.wfile.write(body)
-        def do_GET(self) -> None: self.page()
+        def do_GET(self) -> None:
+            if self.path == "/api/status":
+                body = json.dumps(read_safe_snapshot(data)).encode()
+                self.send_response(200); self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body))); self.end_headers(); self.wfile.write(body); return
+            self.page()
         def do_POST(self) -> None:
             length = int(self.headers.get("Content-Length", 0))
             fields = {k: v[0] for k, v in parse_qs(self.rfile.read(length).decode()).items()}
             try:
-                if self.path == "/connect": response = app.connect(fields)
+                app = worker.app; assert app is not None
+                if self.path == "/chat":
+                    job_id, _ = worker.submit("chat", fields.get("message", ""))
+                    body = json.dumps({"job_id": job_id, "status": "QUEUED"}).encode()
+                    self.send_response(202); self.send_header("Content-Type", "application/json")
+                    self.send_header("Content-Length", str(len(body))); self.end_headers(); self.wfile.write(body); return
+                if self.path == "/connect": response = worker.call("connect", fields)
                 elif self.path == "/import":
-                    count = app.import_secrets(fields.get("path", ""),
-                                               delete_source=fields.get("delete") == "yes")
+                    count = worker.call("import_secrets", fields.get("path", ""), fields.get("delete") == "yes")
                     response = f"Secrets securely imported. Discovered {count} models."
                 elif self.path == "/openrouter":
-                    count = app.connect_openrouter(fields.get("key", ""))
+                    count = worker.call("connect_openrouter", fields.get("key", ""))
                     response = f"OpenRouter connected. Discovered {count} models."
+                elif self.path == "/gemini":
+                    count = worker.call("connect_gemini", fields.get("key", ""))
+                    response = f"Gemini connected. Discovered {count} models."
                 elif self.path == "/local":
-                    count = app.detect_local_models()
+                    count = worker.call("detect_local_models")
                     response = f"Discovered {count} local models."
                 elif self.path == "/policy":
-                    app.runtime.set_routing_policy(fields.get("policy", "AUTO"))
+                    worker.call("set_policy", fields.get("policy", "AUTO"))
                     response = f"Routing policy: {app.runtime.routing_policy}."
                 elif self.path in {"/approve", "/deny"}:
-                    app.runtime.decide_approval(fields["id"], self.path == "/approve")
+                    worker.call("decide_approval", fields["id"], self.path == "/approve")
                     response = "Approval recorded by Pier." if self.path == "/approve" else "Request denied by Pier."
                 else:
-                    message = fields.get("message", ""); response = app.chat(message)
+                    message = fields.get("message", ""); response = worker.call("chat", message)
                     app.transcript.append(f"Pier: {message}\nG.O.D.: {response}")
             except Exception:
                 response = "The request failed. Check provider configuration; no credential details were logged."
@@ -279,7 +377,7 @@ def serve(data: Path, port: int, *, open_browser: bool = True) -> None:
     if open_browser: threading.Timer(.5, webbrowser.open, (f"http://127.0.0.1:{port}",)).start()
     try: server.serve_forever()
     except KeyboardInterrupt: pass
-    finally: server.server_close(); app.close()
+    finally: server.server_close(); worker.close()
 
 
 def main() -> None:
