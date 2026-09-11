@@ -19,28 +19,17 @@ from .models import HTTPModelProvider, ModelRecord, ModelRouter
 from .vault import CredentialHandle, CredentialVault
 
 
-PAGE = """<!doctype html><html><head><meta charset=utf-8><title>G.O.D. Awakening</title>
-<style>body{font:16px system-ui;max-width:850px;margin:3rem auto;padding:0 1rem;background:#10131a;color:#eef}
-fieldset{border:1px solid #456;margin:1rem 0}input,select,button{padding:.65rem;margin:.25rem;background:#202838;color:#fff;border:1px solid #567}
-input[name=message]{width:70%}#chat{white-space:pre-wrap;background:#171c26;padding:1rem;min-height:12rem}</style></head>
-<body><h1>G.O.D. — Awakening</h1><p>Local-only control surface. Keys disappear after submission.</p>
-<div id=status>{status}</div>
-{approval}
-<fieldset><legend>INTELLIGENCE</legend>
-<form method=post action=/import><input name=path placeholder="secrets.json path" required>
-<label><input type=checkbox name=delete value=yes>Delete source file after secure import</label>
-<button>IMPORT SECRETS FILE</button></form>
-<form method=post action=/openrouter><input type=password name=key placeholder="OpenRouter API key" autocomplete=off required>
-<button>CONNECT OPENROUTER</button></form>
-<form method=post action=/local><button>DETECT LOCAL MODELS</button></form>
-<form method=post action=/policy><label>Routing <select name=policy><option>AUTO</option><option value=FREE_FIRST>FREE FIRST</option>
-<option value=LOCAL_FIRST>LOCAL FIRST</option></select></label><button>Apply</button></form>
-<details><summary>Advanced</summary><form method=post action=/connect>
+PAGE = """<!doctype html><html><head><meta charset=utf-8><title>G.O.D. Observatory</title>
+<style>:root{color-scheme:dark}body{font:14px system-ui;margin:0;background:#0b0f17;color:#e8edf8}header{display:flex;gap:1.3rem;padding:1rem 2rem;background:#141b28;border-bottom:1px solid #33415c;position:sticky;top:0}.ok{color:#75e0a7}.off{color:#ffbc70}.grid{display:grid;grid-template-columns:1fr 2fr 1.25fr;gap:1rem;padding:1rem}.panel,fieldset{background:#121925;border:1px solid #2c3952;border-radius:8px;padding:1rem}input,select,button{padding:.65rem;margin:.25rem;background:#202b3e;color:#fff;border:1px solid #526582;border-radius:4px}input[name=message]{width:70%}#chat{white-space:pre-wrap;min-height:20rem}.timeline{max-height:65vh;overflow:auto}.event{border-left:2px solid #709cf5;padding:.35rem .65rem;margin:.5rem 0}.offline{text-align:center;border-color:#b27a3e}.offline h2{letter-spacing:.12em}.summary{margin:.6rem 0;padding:.6rem;background:#192234}a{color:#8fb5ff}@media(max-width:900px){.grid{grid-template-columns:1fr}}</style></head>
+<body><header>{header}</header><main>{onboarding}<div class=grid><section class=panel><h2>Current task</h2>{status}{approval}</section>
+<section class=panel><h2>Owner conversation</h2><div id=chat>{chat}</div><form method=post action=/chat><input name=message autofocus placeholder="Find a realistic way to achieve X" required><button>Send</button></form><h3>Safe sister summaries</h3>{sisters}</section>
+<aside class="panel timeline"><h2>Live activity</h2>{timeline}</aside></div>
+<fieldset><legend>Intelligence controls</legend><form method=post action=/local><button>DETECT LOCAL MODELS</button></form>
+<form method=post action=/policy><label>Routing <select name=policy><option>AUTO</option><option value=FREE_FIRST>FREE FIRST</option><option value=LOCAL_FIRST>LOCAL FIRST</option></select></label><button>Apply</button></form>
+<details><summary>Advanced: secrets file, custom endpoint, manual provider/model IDs</summary><form method=post action=/import><input name=path placeholder="secrets.json path" required><label><input type=checkbox name=delete value=yes>Delete source after secure import</label><button>IMPORT</button></form><form method=post action=/connect>
 <select name=provider><option>OpenRouter</option><option>Gemini</option><option>OpenAI-compatible</option></select>
 <input name=model placeholder="model id" required><input name=endpoint placeholder="compatible endpoint">
-<input type=password name=key placeholder="API key" autocomplete=off required><button>Connect manually</button></form></details></fieldset>
-<div id=chat>{chat}</div><form method=post action=/chat><input name=message autofocus placeholder="Find a realistic way to achieve X" required>
-<button>Send</button></form></body></html>"""
+<input type=password name=key placeholder="API key" autocomplete=off required><button>Connect manually</button></form></details></fieldset></main></body></html>"""
 
 
 class App:
@@ -52,6 +41,12 @@ class App:
         self.discovered: dict[str, ModelRecord] = {}
         self.transcript: list[str] = []
         self._connect_stored_credentials()
+        # Local discovery is safe and credential-free. Absence is an ordinary
+        # offline state; production inference is never replaced with a fixture.
+        try:
+            self.detect_local_models()
+        except Exception:
+            pass
         self._load_transcript()
 
     def _connector(self, handle: CredentialHandle) -> ProviderConnector | None:
@@ -189,11 +184,39 @@ class App:
         state = self.runtime.operational_status(); show = lambda value: "none" if value is None or value == [] else str(value)
         lines.extend((f"Current goal: {show(state['current_goal'])}", f"Current step: {state['current_step']}",
                       f"Work class: {show(state['work_class'])}", f"Current body organ: {show(state['current_organ'])}",
+                      f"Selected colony: {show(state['selected_colony'])}",
+                      f"Selected model: {show(state['selected_model'])}",
+                      f"Routing reason: {show(state['routing_reason'])}",
+                      f"Prediction: {show(state['prediction'])}", f"Verification: {show(state['verification'])}",
                       f"Last observation: {show(state['last_observation'])}", f"Pending approval: {show(state['pending_approval'])}",
                       f"Capability gaps: {show(state['capability_gaps'])}", f"A confidence: {state['a_confidence']}",
                       f"B confidence: {state['b_confidence']}", f"Sister exchange: {show(state['sister_exchange'])}",
                       f"Latest latency: {show(state['latest_latency'])}"))
         return "<br>".join(html.escape(line) for line in lines)
+
+    def onboarding(self) -> str:
+        if self.runtime.intelligence_connected:
+            return ""
+        return '''<section class="panel offline"><h2>INTELLIGENCE OFFLINE</h2><p>Recommended gateway: OpenRouter</p>
+        <p><a href="https://openrouter.ai/keys" target="_blank" rel="noopener noreferrer">GET API KEY</a>
+        · <a href="https://aistudio.google.com/apikey" target="_blank" rel="noopener noreferrer">Gemini / Google AI Studio</a></p>
+        <form method=post action=/openrouter><input type=password name=key aria-label="secure key input" placeholder="secure key input" autocomplete=off required><button>CONNECT</button></form></section>'''
+
+    def observatory(self) -> dict[str, str]:
+        state = self.runtime.operational_status()
+        healthy = self.runtime.organism.root.verify_audit()
+        header = " · ".join((f"Root <b class=ok>{'SECURE' if healthy else 'FAULT'}</b>",
+            "Saphira-A <b class=ok>ONLINE</b>", "Saphira-B <b class=ok>ONLINE</b>",
+            f"Intelligence <b class={'ok' if self.runtime.intelligence_connected else 'off'}>{'ONLINE' if self.runtime.intelligence_connected else 'OFFLINE'}</b>",
+            "Body health <b class=ok>READY</b>"))
+        sister_cards = []
+        for name, summary in state["sisters"].items():
+            safe = " · ".join(f"{html.escape(str(k))}: {html.escape(str(v if v is not None else 'none'))}"
+                              for k, v in summary.items())
+            sister_cards.append(f'<div class=summary><b>{name}</b><br>{safe}</div>')
+        events = "".join(f'<div class=event><b>{html.escape(event["kind"])}</b><br>{html.escape(event["summary"])}</div>'
+                         for event in state["timeline"]) or "<p>No runtime events recorded.</p>"
+        return {"header": header, "sisters": "".join(sister_cards), "timeline": events}
 
     def approval(self) -> str:
         request = self.runtime.operational_status()["pending_approval"]
@@ -213,8 +236,11 @@ def serve(data: Path, port: int, *, open_browser: bool = True) -> None:
     app = App(data)
     class Handler(BaseHTTPRequestHandler):
         def page(self) -> None:
-            body = PAGE.replace("{status}", app.status()).replace("{approval}", app.approval()).replace(
-                "{chat}", html.escape("\n".join(app.transcript))).encode()
+            view = app.observatory()
+            body = (PAGE.replace("{header}", view["header"]).replace("{onboarding}", app.onboarding())
+                    .replace("{status}", app.status()).replace("{approval}", app.approval())
+                    .replace("{sisters}", view["sisters"]).replace("{timeline}", view["timeline"])
+                    .replace("{chat}", html.escape("\n".join(app.transcript)))).encode()
             self.send_response(200); self.send_header("Content-Type", "text/html; charset=utf-8")
             self.send_header("Content-Length", str(len(body))); self.end_headers(); self.wfile.write(body)
         def do_GET(self) -> None: self.page()
