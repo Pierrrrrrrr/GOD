@@ -24,3 +24,8 @@ Install once with `py -3.11 -m pip install -e .`, then double-click
 `http://127.0.0.1:8765`. Connect OpenRouter, Gemini, or an OpenAI-compatible
 endpoint; credentials are kept in a separate OS/user-protected vault and are
 never displayed after submission.
+
+Normal onboarding requires no model identifier or endpoint: import a local JSON
+secrets file, connect OpenRouter with one key, or detect an existing Ollama
+installation. G.O.D. discovers compatible models and routes them with `AUTO`,
+`FREE FIRST`, or `LOCAL FIRST`; manual configuration remains under Advanced.

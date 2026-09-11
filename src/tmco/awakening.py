@@ -110,6 +110,7 @@ class GodRuntime:
         self.bus = ModelBus(production=True)
         self.router = ModelRouter()
         self.records: dict[str, ModelRecord] = {}
+        self.routing_policy = "AUTO"
         self.cognition: Cognition = DisconnectedCognition()
         self.policy = formation_policy or AssemblyFormationPolicy()
         # Existing Phase 1 state format remains the authority for organism identity/neural state.
@@ -123,6 +124,11 @@ class GodRuntime:
     def intelligence_connected(self) -> bool:
         return bool(self.bus.providers and self.records)
 
+    def set_routing_policy(self, policy: str) -> None:
+        if policy not in {"AUTO", "FREE_FIRST", "LOCAL_FIRST"}:
+            raise ValueError("unknown routing policy")
+        self.routing_policy = policy
+
     def attach_intelligence(self, providers: dict[str, ModelProvider],
                             records: list[ModelRecord]) -> None:
         bus = ModelBus(providers, production=True)
@@ -135,10 +141,17 @@ class GodRuntime:
         # unavailability must not prevent this newly confirmed connection.
         for key, record in configured.items():
             self.records[key].availability = record.availability
-        initial = self.router.choose(list(self.records.values()), "conversation")
+        initial = self.router.choose(list(self.records.values()), "conversation",
+                                     policy=self.routing_policy)
         self.cognition = ModelBackedCognition(self.bus, initial)
         self.organism.executive.cognition = self.cognition
         self._save_models()
+
+    def detach_intelligence(self) -> None:
+        self.bus = ModelBus(production=True)
+        self.records = {}
+        self.cognition = DisconnectedCognition()
+        self.organism.executive.cognition = self.cognition
 
     def _restore_models(self) -> None:
         for row in self.store.rows("SELECT state FROM models"):
@@ -163,7 +176,8 @@ class GodRuntime:
         used: set[str] = set()
         colonies = list(self.organism.colonies.items()) if important else [self._best_colony(decisions)]
         for name, colony in colonies:
-            record = self.router.choose(list(self.records.values()), "goal_reasoning", exclude=used)
+            record = self.router.choose(list(self.records.values()), "goal_reasoning", exclude=used,
+                                        policy=self.routing_policy)
             used.add(record.key)
             started = time.monotonic()
             cognition = ModelBackedCognition(self.bus, record)
@@ -181,7 +195,8 @@ class GodRuntime:
         material_disagreement = False
         materiality_reasons: list[str] = []
         if candidate_disagreement:
-            record = self.router.choose(list(self.records.values()), "disagreement_assessment")
+            record = self.router.choose(list(self.records.values()), "disagreement_assessment",
+                                        policy=self.routing_policy)
             started = time.monotonic()
             assessment = ModelBackedCognition(self.bus, record).ask(
                 "Assess only whether these core claims conflict enough to change the decision. Return a JSON "
@@ -195,7 +210,8 @@ class GodRuntime:
             self.router.observe_call(record, True, (time.monotonic() - started) * 1000)
         audit = None
         if material_disagreement:
-            record = self.router.choose(list(self.records.values()), "sister_audit")
+            record = self.router.choose(list(self.records.values()), "sister_audit",
+                                        policy=self.routing_policy)
             started = time.monotonic()
             audit = ModelBackedCognition(self.bus, record).ask(
                 "Act as a separate sister-audit demand. Identify material disagreements, assess each argument "
@@ -279,7 +295,8 @@ class GodRuntime:
         else:
             if not self.intelligence_connected:
                 raise ProviderUnavailable("external intelligence is disconnected")
-            record = self.router.choose(list(self.records.values()), "conversation")
+            record = self.router.choose(list(self.records.values()), "conversation",
+                                        policy=self.routing_policy)
             persisted = json.loads(active[0]["state"]) if active else None
             result = ModelBackedCognition(self.bus, record).ask(
                 "Reply naturally and truthfully. Do not invent activity; use only supplied persisted state.",

@@ -25,6 +25,7 @@ class ModelRecord:
     calibration: float = .5
     quality_observations: int = 0
     last_tested: float | None = None
+    privacy: str = "remote"
 
     @property
     def key(self) -> str:
@@ -84,10 +85,18 @@ class ModelRouter:
     """Evidence-driven routing; no colony is pinned to a provider or function."""
 
     def choose(self, records: list[ModelRecord], task: str, *, privacy: bool = False,
-               exclude: set[str] | None = None) -> ModelRecord:
+               exclude: set[str] | None = None, policy: str = "AUTO",
+               requires_tools: bool = False, min_context: int = 0,
+               required_modality: str = "text") -> ModelRecord:
         candidates = [r for r in records if r.availability and r.key not in (exclude or set())]
+        candidates = [r for r in candidates if (not requires_tools or r.tool_capability)
+                      and (r.context_capability is None or r.context_capability >= min_context)
+                      and required_modality in r.modalities]
         if not candidates:
-            candidates = [r for r in records if r.availability]
+            candidates = [r for r in records if r.availability
+                          and (not requires_tools or r.tool_capability)
+                          and (r.context_capability is None or r.context_capability >= min_context)
+                          and required_modality in r.modalities]
         if not candidates:
             raise RuntimeError("no available model is configured")
         def score(r: ModelRecord) -> tuple[float, str]:
@@ -96,7 +105,11 @@ class ModelRouter:
             cost = (r.input_cost or 0) + (r.output_cost or 0)
             latency = r.latency_ms / 100_000
             privacy_penalty = .25 if privacy and r.provider == "openrouter" else 0
-            return quality + reliability - cost - latency - privacy_penalty, r.key
+            known_free = r.input_cost == 0 and r.output_cost == 0
+            preference = (1.0 if policy == "LOCAL_FIRST" and r.privacy == "local" else
+                          1.0 if policy == "FREE_FIRST" and known_free else
+                          .15 if policy == "AUTO" and r.model_id == "openrouter/free" else 0.0)
+            return preference + quality + reliability - cost - latency - privacy_penalty, r.key
         return max(candidates, key=score)
 
     @staticmethod

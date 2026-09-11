@@ -13,8 +13,10 @@ from pathlib import Path
 from urllib.parse import parse_qs
 
 from .awakening import GodRuntime
+from .connectors import (GeminiConnector, OllamaConnector, OpenAICompatibleConnector,
+                         OpenRouterConnector, ProviderConnector)
 from .models import HTTPModelProvider, ModelRecord, ModelRouter
-from .vault import CredentialVault
+from .vault import CredentialHandle, CredentialVault
 
 
 PAGE = """<!doctype html><html><head><meta charset=utf-8><title>G.O.D. Awakening</title>
@@ -23,10 +25,19 @@ fieldset{border:1px solid #456;margin:1rem 0}input,select,button{padding:.65rem;
 input[name=message]{width:70%}#chat{white-space:pre-wrap;background:#171c26;padding:1rem;min-height:12rem}</style></head>
 <body><h1>G.O.D. — Awakening</h1><p>Local-only control surface. Keys disappear after submission.</p>
 <div id=status>{status}</div>
-<fieldset><legend>Connect a replaceable cognitive organ</legend><form method=post action=/connect>
+<fieldset><legend>INTELLIGENCE</legend>
+<form method=post action=/import><input name=path placeholder="secrets.json path" required>
+<label><input type=checkbox name=delete value=yes>Delete source file after secure import</label>
+<button>IMPORT SECRETS FILE</button></form>
+<form method=post action=/openrouter><input type=password name=key placeholder="OpenRouter API key" autocomplete=off required>
+<button>CONNECT OPENROUTER</button></form>
+<form method=post action=/local><button>DETECT LOCAL MODELS</button></form>
+<form method=post action=/policy><label>Routing <select name=policy><option>AUTO</option><option value=FREE_FIRST>FREE FIRST</option>
+<option value=LOCAL_FIRST>LOCAL FIRST</option></select></label><button>Apply</button></form>
+<details><summary>Advanced</summary><form method=post action=/connect>
 <select name=provider><option>OpenRouter</option><option>Gemini</option><option>OpenAI-compatible</option></select>
-<input name=model placeholder="model id" required><input name=endpoint placeholder="compatible endpoint (optional)">
-<input type=password name=key placeholder="API key" autocomplete=off required><button>Securely connect</button></form></fieldset>
+<input name=model placeholder="model id" required><input name=endpoint placeholder="compatible endpoint">
+<input type=password name=key placeholder="API key" autocomplete=off required><button>Connect manually</button></form></details></fieldset>
 <div id=chat>{chat}</div><form method=post action=/chat><input name=message autofocus placeholder="Find a realistic way to achieve X" required>
 <button>Send</button></form></body></html>"""
 
@@ -36,12 +47,80 @@ class App:
         self.data, self.vault = data, CredentialVault(data)
         # The organism is primary and always boots; intelligence is an attachable organ.
         self.runtime = GodRuntime(data)
+        self.connectors: dict[str, ProviderConnector] = {}
+        self.discovered: dict[str, ModelRecord] = {}
         self.transcript: list[str] = []
-        credentials = self.vault.load()
-        if credentials:
-            try: self._connect(credentials)
-            except Exception: pass
+        self._connect_stored_credentials()
         self._load_transcript()
+
+    def _connector(self, handle: CredentialHandle) -> ProviderConnector | None:
+        key = self.vault.resolve(handle)
+        if handle.provider == "openrouter":
+            return OpenRouterConnector(key)
+        if handle.provider == "gemini":
+            return GeminiConnector(key)
+        if handle.provider == "groq":
+            return OpenAICompatibleConnector("groq", "https://api.groq.com/openai/v1/chat/completions", key)
+        return None
+
+    def _connect_stored_credentials(self) -> None:
+        for handle in self.vault.handles():
+            try:
+                connector = self._connector(handle)
+                if connector is not None:
+                    self._add_connector(connector)
+            except Exception:
+                continue
+        self._apply_connectors()
+
+    def _add_connector(self, connector: ProviderConnector) -> int:
+        records = connector.discover()
+        if not records:
+            return 0
+        preferred = next((r for r in records if r.model_id == "openrouter/free"), records[0])
+        connector.probe(preferred.model_id)
+        self.connectors[connector.name] = connector
+        self.discovered.update((record.key, record) for record in records)
+        return len(records)
+
+    def _apply_connectors(self) -> None:
+        if self.connectors and self.discovered:
+            self.runtime.attach_intelligence(self.connectors, list(self.discovered.values()))
+
+    def import_secrets(self, path: str, *, delete_source: bool = False) -> int:
+        handles = self.vault.import_file(Path(path), delete_source=delete_source)
+        count = 0
+        for handle in handles:
+            connector = self._connector(handle)
+            if connector is not None:
+                try: count += self._add_connector(connector)
+                except Exception: continue
+        self._apply_connectors()
+        return count
+
+    def connect_openrouter(self, api_key: str) -> int:
+        connector = OpenRouterConnector(api_key)
+        records = connector.discover()
+        if not records:
+            raise RuntimeError("provider catalog is unavailable")
+        preferred = next((r for r in records if r.model_id == "openrouter/free"), records[0])
+        connector.probe(preferred.model_id)
+        self.vault.set_provider("openrouter", api_key)
+        self.connectors[connector.name] = connector
+        self.discovered.update((record.key, record) for record in records)
+        self._apply_connectors()
+        return len(records)
+
+    def detect_local_models(self) -> int:
+        connector = OllamaConnector()
+        records = connector.discover()
+        if not records:
+            return 0
+        connector.probe(records[0].model_id)
+        self.connectors[connector.name] = connector
+        self.discovered.update((record.key, record) for record in records)
+        self._apply_connectors()
+        return len(records)
 
     def _connect(self, values: dict[str, str]) -> None:
         provider, model, key = values["provider"], values["model"], values["key"]
@@ -76,7 +155,8 @@ class App:
 
     def connect(self, values: dict[str, str]) -> str:
         self._connect(values)
-        self.vault.save(values)
+        provider = "gemini" if values["provider"] == "Gemini" else "openrouter"
+        self.vault.set_provider(provider, values["key"])
         return "Connected. The credential is protected and is not displayed."
 
     @staticmethod
@@ -103,6 +183,8 @@ class App:
                  f"Intelligence {intelligence}"] if healthy else [
                      "Saphira-A OFFLINE", "Saphira-B OFFLINE", "Root NOT INITIALIZED",
                      f"Intelligence {intelligence}"]
+        lines.append(f"Discovered providers: {len(self.runtime.bus.providers)}; models: {len(self.runtime.records)}")
+        lines.append(f"Routing: {self.runtime.routing_policy}")
         active = self.runtime.store.rows(
             "SELECT description FROM goals WHERE status='active' ORDER BY rowid DESC LIMIT 1")
         if active: lines.append(f"Active goal: {active[0]['description']}")
@@ -129,12 +211,25 @@ def serve(data: Path, port: int, *, open_browser: bool = True) -> None:
             fields = {k: v[0] for k, v in parse_qs(self.rfile.read(length).decode()).items()}
             try:
                 if self.path == "/connect": response = app.connect(fields)
+                elif self.path == "/import":
+                    count = app.import_secrets(fields.get("path", ""),
+                                               delete_source=fields.get("delete") == "yes")
+                    response = f"Secrets securely imported. Discovered {count} models."
+                elif self.path == "/openrouter":
+                    count = app.connect_openrouter(fields.get("key", ""))
+                    response = f"OpenRouter connected. Discovered {count} models."
+                elif self.path == "/local":
+                    count = app.detect_local_models()
+                    response = f"Discovered {count} local models."
+                elif self.path == "/policy":
+                    app.runtime.set_routing_policy(fields.get("policy", "AUTO"))
+                    response = f"Routing policy: {app.runtime.routing_policy}."
                 else:
                     message = fields.get("message", ""); response = app.chat(message)
                     app.transcript.append(f"Pier: {message}\nG.O.D.: {response}")
             except Exception:
                 response = "The request failed. Check provider configuration; no credential details were logged."
-            if self.path == "/connect": app.transcript.append(response)
+            if self.path != "/chat": app.transcript.append(response)
             self.send_response(303); self.send_header("Location", "/"); self.end_headers()
         def log_message(self, format: str, *args: object) -> None: pass
     # The runtime and its SQLite connection are intentionally confined to this
