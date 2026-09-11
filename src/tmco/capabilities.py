@@ -106,8 +106,7 @@ class OwnerCapabilityAuthority:
         return request_id
 
     def decide(self, approval: OwnerApproval) -> OwnerCapability | None:
-        if getattr(approval, "_OwnerApproval__token", None) is not self.__host_token:
-            raise AuthorizationError("approval is not bound to this host authority")
+        self._verify_owner_approval(approval)
         state = self._get(approval.request_id)
         if state["status"] != SetupState.AWAITING_PIER: raise AuthorizationError("fresh approval required")
         if not approval.approved:
@@ -124,7 +123,11 @@ class OwnerCapabilityAuthority:
         if not data: raise AuthorizationError("workflow is not authorized")
         data["request"] = self._request(data["request"]); return OwnerCapability(**data)
 
-    def consume(self, capability: OwnerCapability, actual: CapabilityRequest, *, executor_principal: str) -> None:
+    def _verify_owner_approval(self, approval: OwnerApproval) -> None:
+        if not isinstance(approval, OwnerApproval) or getattr(approval, "_OwnerApproval__token", None) is not self.__host_token:
+            raise AuthorizationError("approval is not bound to this host authority")
+
+    def start(self, capability: OwnerCapability, actual: CapabilityRequest, *, executor_principal: str) -> None:
         state = self._get(capability.request_id)
         if state["consumed"]: raise AuthorizationError("owner capability has already been used")
         if state["revoked"] or state["status"] != SetupState.AUTHORIZED: raise AuthorizationError("workflow is not authorized")
@@ -135,18 +138,29 @@ class OwnerCapabilityAuthority:
                 self.__root.verify_owner_capability(self._payload(capability.request_id, capability.request,
                     capability.expires_at, capability.nonce), capability.signature):
             raise AuthorizationError("owner capability signature is invalid")
-        state.update(consumed=True, status=SetupState.COMPLETE); self._put(capability.request_id, state)
+        state.update(consumed=True, status=SetupState.RUNNING); self._put(capability.request_id, state)
+
+    # Compatibility name: consumption means consuming the right to START, not completion.
+    def consume(self, capability: OwnerCapability, actual: CapabilityRequest, *, executor_principal: str) -> None:
+        self.start(capability, actual, executor_principal=executor_principal)
 
     def pause(self, request_id: str, checkpoint: HumanCheckpoint) -> None:
         state = self._get(request_id)
-        if state["status"] not in {SetupState.AUTHORIZED, SetupState.RUNNING}: raise AuthorizationError("workflow cannot pause")
+        if state["status"] != SetupState.RUNNING: raise AuthorizationError("workflow cannot pause")
         state.update(status=SetupState.PAUSED_FOR_PIER, checkpoint=checkpoint); self._put(request_id, state)
 
     def resume(self, approval: OwnerApproval, actual: CapabilityRequest) -> None:
+        self._verify_owner_approval(approval)
         state = self._get(approval.request_id)
         if not approval.approved or state["status"] != SetupState.PAUSED_FOR_PIER or self._request(state["request"]) != actual:
             raise AuthorizationError("checkpoint resume must match the exact approved workflow")
-        state.update(status=SetupState.AUTHORIZED, checkpoint=None); self._put(approval.request_id, state)
+        state.update(status=SetupState.RUNNING, checkpoint=None); self._put(approval.request_id, state)
+
+    def complete(self, request_id: str, *, executor_principal: str) -> None:
+        state = self._get(request_id); request = self._request(state["request"])
+        if state["status"] != SetupState.RUNNING or executor_principal != request.executor_principal:
+            raise AuthorizationError("only the exact running workflow executor may complete")
+        state["status"] = SetupState.COMPLETE; self._put(request_id, state)
 
     def status(self, request_id: str) -> SetupState: return SetupState(self._get(request_id)["status"])
     def close(self) -> None: self.__db.commit(); self.__db.close()

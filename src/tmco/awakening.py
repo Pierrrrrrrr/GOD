@@ -167,7 +167,7 @@ class GodRuntime:
         self.embodiment_store = EmbodimentStore(directory / "embodiment.sqlite3")
         self.organ_registry = OrganRegistry(self.body_bus, self.embodiment_store)
         self.capability_resolver = CapabilityResolver(self.body_bus, self.embodiment_store)
-        self.action_loop = ActionLoop(self.body_bus, self.embodiment_store)
+        self.action_loop = ActionLoop(self.body_bus, self.embodiment_store, self._action_event)
         self.permission_authority = PermissionAuthority(self.embodiment_store)
         self.owner_capabilities = OwnerCapabilityAuthority(self.organism.root,
                                                            directory / "owner_capabilities.sqlite3")
@@ -193,6 +193,15 @@ class GodRuntime:
             description="public read-only research", permissions={"public.read"}, side_effect_class="read",
             capability_tags={"web"}, network_scope=("public-http-test" if test_hosts else "public-https",), verified_reliability=.8)
         self.organ_registry.register(web_manifest, {method: (lambda args, method=method: web.request({**args, "method": method})) for method in ("GET", "HEAD")})
+
+    def _action_event(self, kind: str, state: dict[str, Any]) -> None:
+        summaries = {"APPROVAL_REQUIRED": "Pier approval required",
+                     "PREDICTION_STORED": "Action prediction persisted",
+                     "ORGAN_STARTED": "Body organ invocation started",
+                     "OBSERVATION_RECEIVED": "Body observation persisted",
+                     "VERIFICATION_CHANGED": "Observation verification changed",
+                     "FAILED": "Body invocation failed"}
+        self._event(kind, summaries[kind], state)
 
     def _restore_exchange_rounds(self) -> None:
         for event in self.embodiment_store.all("exchange"):
@@ -366,7 +375,8 @@ class GodRuntime:
         if demands:
             episode["body"] = self._run_body_plan(state, demands, interpretations)
             self.store.put("episodes", episode["id"], episode)
-        self._event("FINAL_RESPONSE", "Synchronous goal step completed", {"goal_id": goal_id})
+        if not demands or episode.get("body", {}).get("status") == "executed":
+            self._event("FINAL_RESPONSE", "Synchronous goal response returned", {"goal_id": goal_id})
         return episode
 
     def _dynamic_primary(self, text: str) -> tuple[str, Any]:
@@ -463,28 +473,24 @@ class GodRuntime:
                 state["current_organ"] = resolved[0].id; self.store.put("goals", state["id"], state)
                 self._event("CAPABILITY_RESOLVED", f"Demand resolved to {resolved[0].id}",
                             {"goal_id": state["id"], "organ": resolved[0].id})
-                self._event("PREDICTION_STORED", "Action prediction persisted", {"goal_id": state["id"],
-                            "demand_id": demand.id})
-                self._event("ORGAN_STARTED", f"{resolved[0].id} operation started", {"goal_id": state["id"],
-                            "organ": resolved[0].id, "operation": resolved[1]})
-                if acting_colony: self._sister_transition(acting_colony, state["id"], "ACTING", "Approved body operation running")
             result = self.action_loop.execute(demand)
             if isinstance(result, HumanApprovalRequest):
                 state.update(current_step="pending_approval", pending_approval=result.id); self.store.put("goals",state["id"],state)
-                self._event("APPROVAL_REQUIRED", "Pier approval required", {"goal_id": state["id"], "request_id": result.id})
                 if acting_colony: self._sister_transition(acting_colony, state["id"], "WAITING", "Waiting for Pier approval")
                 return {"status":"pending_approval","request":asdict(result)}
             if not isinstance(result, ObservationEnvelope):
                 state.update(current_step="capability_gap"); self.store.put("goals",state["id"],state)
                 self._event("CAPABILITY_GAP", "No safe compatible organ", {"goal_id": state["id"], "demand_id": demand.id})
                 return {"status":"gap"}
-            self._event("OBSERVATION_RECEIVED", f"Observation received from {result.organ}",
-                        {"goal_id": state["id"], "organ": result.organ, "action_id": result.action_id})
+            if acting_colony: self._sister_transition(acting_colony, state["id"], "ACTING", "Body operation invoked")
             if acting_colony: self._sister_transition(acting_colony, state["id"], "VERIFYING", "Checking body observation")
             level = VerificationLevel.TRANSPORT_VERIFIED if demand.required_capability == "web" else VerificationLevel.ARTIFACT_VERIFIED
             verified = self.action_loop.verify(result, lambda obs: obs.success and bool(obs.content_hash), level)
-            self._event("VERIFICATION_CHANGED", f"Verification {'passed' if verified else 'failed'}",
-                        {"goal_id": state["id"], "action_id": result.action_id, "verified": verified})
+            if not result.success:
+                state.update(status="failed", current_step="FAILED", last_observation=result.action_id)
+                self.store.put("goals", state["id"], state)
+                if acting_colony: self._sister_transition(acting_colony, state["id"], "BLOCKED", "Body invocation failed")
+                return {"status": "failed", "observations": [asdict(result)]}
             if verified:
                 manifest = self.body_bus.manifests[result.organ]
                 manifest.verified_reliability = min(1, manifest.verified_reliability + .01)

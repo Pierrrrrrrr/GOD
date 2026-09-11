@@ -12,7 +12,7 @@ import queue
 from uuid import uuid4
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
-from urllib.parse import parse_qs
+from urllib.parse import parse_qs, urlsplit
 
 from .awakening import GodRuntime
 from .connectors import (GeminiConnector, OllamaConnector, OpenAICompatibleConnector,
@@ -25,8 +25,8 @@ PROVIDER_STATES = {"CONNECTED", "INVALID_CREDENTIAL", "UNAVAILABLE", "RECONNECT_
 
 PAGE = """<!doctype html><html><head><meta charset=utf-8><title>G.O.D. Observatory</title>
 <style>:root{color-scheme:dark}body{font:14px system-ui;margin:0;background:#0b0f17;color:#e8edf8}header{display:flex;gap:1.3rem;padding:1rem 2rem;background:#141b28;border-bottom:1px solid #33415c;position:sticky;top:0}.ok{color:#75e0a7}.off{color:#ffbc70}.grid{display:grid;grid-template-columns:1fr 2fr 1.25fr;gap:1rem;padding:1rem}.panel,fieldset{background:#121925;border:1px solid #2c3952;border-radius:8px;padding:1rem}input,select,button{padding:.65rem;margin:.25rem;background:#202b3e;color:#fff;border:1px solid #526582;border-radius:4px}input[name=message]{width:70%}#chat{white-space:pre-wrap;min-height:20rem}.timeline{max-height:65vh;overflow:auto}.event{border-left:2px solid #709cf5;padding:.35rem .65rem;margin:.5rem 0}.offline{text-align:center;border-color:#b27a3e}.offline h2{letter-spacing:.12em}.summary{margin:.6rem 0;padding:.6rem;background:#192234}a{color:#8fb5ff}@media(max-width:900px){.grid{grid-template-columns:1fr}}</style></head>
-<body><header>{header}</header><main>{onboarding}<div class=grid><section class=panel><h2>Current task</h2>{status}{approval}</section>
-<section class=panel><h2>Owner conversation</h2><div id=chat>{chat}</div><form method=post action=/chat><input name=message autofocus placeholder="Find a realistic way to achieve X" required><button>Send</button></form><h3>Safe sister summaries</h3>{sisters}</section>
+<body><header>{header}</header><main>{onboarding}<div class=grid><section class=panel><h2>Current task</h2><div id=task>{status}</div>{approval}</section>
+<section class=panel><h2>Owner conversation</h2><div id=chat>{chat}</div><form id=chat-form method=post action=/chat><input name=message autofocus placeholder="Find a realistic way to achieve X" required><button>Send</button></form><h3>Safe sister summaries</h3><div id=sisters>{sisters}</div></section>
 <aside class="panel timeline"><h2>Live activity</h2><div id=events>{timeline}</div></aside></div>
 <fieldset><legend>Intelligence controls</legend><form method=post action=/local><button>DETECT LOCAL MODELS</button></form>
 <form method=post action=/policy><label>Routing <select name=policy><option>AUTO</option><option value=FREE_FIRST>FREE FIRST</option><option value=LOCAL_FIRST>LOCAL FIRST</option></select></label><button>Apply</button></form>
@@ -34,7 +34,15 @@ PAGE = """<!doctype html><html><head><meta charset=utf-8><title>G.O.D. Observato
 <select name=provider><option>OpenRouter</option><option>Gemini</option><option>OpenAI-compatible</option></select>
 <input name=model placeholder="model id" required><input name=endpoint placeholder="compatible endpoint">
 <input type=password name=key placeholder="API key" autocomplete=off required><button>Connect manually</button></form></details></fieldset></main>
-<script>setInterval(async()=>{const r=await fetch('/api/status',{cache:'no-store'});if(!r.ok)return;const s=await r.json();document.querySelector('#events').innerHTML=s.timeline.slice().reverse().map(e=>`<div class=event><b>${e.kind}</b><br>${e.summary}</div>`).join('')},750)</script></body></html>"""
+<script>
+const esc=x=>String(x??'none').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+async function poll(){const r=await fetch('/api/status',{cache:'no-store'});if(!r.ok)return;const s=await r.json();
+document.querySelector('#events').innerHTML=s.timeline.slice().reverse().map(e=>`<div class=event><b>${esc(e.kind)}</b><br>${esc(e.summary)}</div>`).join('');
+document.querySelector('#task').innerHTML=['job: '+esc(s.job?.state),'goal: '+esc(s.goal?.description),'step: '+esc(s.goal?.current_step),'work class: '+esc(s.goal?.work_class),'selected colony: '+esc(s.goal?.selected_colony),'selected model: '+esc(s.selection&&s.selection.provider+':'+s.selection.model_id),'routing reason: '+esc(s.selection?.routing_reason),'organ: '+esc(s.goal?.current_organ),'verification: '+esc(s.verification),'pending approval: '+esc(s.pending_approval?.id),'capability gap: '+esc(s.capability_gap?.reason)].join('<br>');
+document.querySelector('#sisters').innerHTML=Object.entries(s.sisters).map(([n,v])=>`<div class=summary><b>${esc(n)}</b><br>${esc(v?.status)} · ${esc(v?.summary)} · confidence ${esc(v?.confidence)}</div>`).join('');
+document.querySelector('#chat').textContent=s.conversation.map(x=>(x.role==='user'?'Pier: ':'G.O.D.: ')+x.content).join('\n');}
+document.querySelector('#chat-form').addEventListener('submit',async e=>{e.preventDefault();const f=e.currentTarget;await fetch('/chat',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:new URLSearchParams(new FormData(f))});f.reset();poll()});setInterval(poll,750);
+</script></body></html>"""
 
 
 class App:
@@ -269,6 +277,7 @@ class RuntimeWorker:
     """Owns App, GodRuntime, and every writable SQLite connection on one thread."""
     def __init__(self, data: Path):
         self.data, self.jobs = data, queue.Queue()
+        self.states: dict[str, dict[str, object]] = {}; self.lock = threading.Lock()
         self.ready = threading.Event(); self.app: App | None = None
         self.thread = threading.Thread(target=self._run, name="god-runtime-owner")
         self.thread.start(); self.ready.wait()
@@ -279,15 +288,32 @@ class RuntimeWorker:
             job_id, operation, arguments, reply = self.jobs.get()
             if operation == "stop":
                 self.app.close(); reply.put(None); return
-            try: reply.put((True, getattr(self.app, operation)(*arguments)))
-            except Exception as error: reply.put((False, type(error).__name__))
+            with self.lock: self.states[job_id]["state"] = "RUNNING"
+            try:
+                result = getattr(self.app, operation)(*arguments)
+                if operation == "chat":
+                    self.app.transcript.append(f"Pier: {arguments[0]}\nG.O.D.: {result}")
+                runtime_state = self.app.runtime.operational_status()
+                state = "WAITING_FOR_APPROVAL" if runtime_state["pending_approval"] else "COMPLETE"
+                with self.lock: self.states[job_id].update(state=state, result=str(result))
+                reply.put((True, result))
+            except Exception as error:
+                with self.lock: self.states[job_id].update(state="FAILED", error=type(error).__name__)
+                reply.put((False, type(error).__name__))
 
-    def submit(self, operation: str, *arguments: object) -> tuple[str, queue.Queue]:
+    def submit(self, operation: str, *arguments: object, _exposed: bool = True) -> tuple[str, queue.Queue]:
         identity, reply = uuid4().hex, queue.Queue(maxsize=1)
+        with self.lock: self.states[identity] = {"job_id": identity, "state": "QUEUED", "result": None,
+                                                "exposed": _exposed}
         self.jobs.put((identity, operation, arguments, reply)); return identity, reply
 
+    def snapshot_jobs(self) -> dict[str, dict[str, object]]:
+        with self.lock: return {key: {k: v for k, v in value.items() if k != "exposed"}
+                                for key, value in self.states.items() if value["exposed"]}
+
     def call(self, operation: str, *arguments: object) -> object:
-        _, reply = self.submit(operation, *arguments); success, result = reply.get()
+        identity, reply = self.submit(operation, *arguments, _exposed=False); success, result = reply.get()
+        with self.lock: self.states.pop(identity, None)
         if not success: raise RuntimeError(str(result))
         return result
 
@@ -295,10 +321,11 @@ class RuntimeWorker:
         reply = queue.Queue(maxsize=1); self.jobs.put(("shutdown", "stop", (), reply)); reply.get(); self.thread.join()
 
 
-def read_safe_snapshot(data: Path) -> dict[str, object]:
+def read_safe_snapshot(data: Path, jobs: dict[str, dict[str, object]] | None = None,
+                       job_id: str | None = None) -> dict[str, object]:
     """Read WAL snapshots without touching the runtime owner's connections."""
     database = data / "awakening.sqlite3"
-    if not database.exists(): return {"timeline": [], "sisters": {}, "selection": None}
+    if not database.exists(): return {"timeline": [], "sisters": {}, "selection": None, "job": None}
     connection = sqlite3.connect(f"file:{database}?mode=ro", uri=True)
     connection.row_factory = sqlite3.Row
     try:
@@ -312,7 +339,26 @@ def read_safe_snapshot(data: Path) -> dict[str, object]:
         selected = connection.execute("SELECT goal_id,episode_id,task_class,colony,provider,model_id,routing_policy,"
                                       "routing_reason,started_at,finished_at,latency_ms,success FROM model_selections "
                                       "ORDER BY started_at DESC LIMIT 1").fetchone()
-        return {"timeline": events, "sisters": sisters, "selection": dict(selected) if selected else None}
+        goal_row = connection.execute("SELECT state FROM goals ORDER BY rowid DESC LIMIT 1").fetchone()
+        goal = json.loads(goal_row[0]) if goal_row else None
+        conversation = [dict(row) for row in connection.execute("SELECT role,content,created FROM chat ORDER BY id")]
+        verification = None
+        pending = gap = None
+        body = data / "embodiment.sqlite3"
+        if body.exists():
+            body_db = sqlite3.connect(f"file:{body}?mode=ro", uri=True); body_db.row_factory = sqlite3.Row
+            try:
+                approval = body_db.execute("SELECT state FROM body WHERE kind='approval' ORDER BY rowid DESC LIMIT 1").fetchone()
+                gap_row = body_db.execute("SELECT state FROM body WHERE kind='gap' ORDER BY rowid DESC LIMIT 1").fetchone()
+                observation = body_db.execute("SELECT state FROM body WHERE kind='observation' ORDER BY rowid DESC LIMIT 1").fetchone()
+                pending = json.loads(approval[0]) if approval and json.loads(approval[0]).get("status") == "pending" else None
+                gap = json.loads(gap_row[0]) if gap_row else None
+                verification = json.loads(observation[0]).get("verification_state") if observation else None
+            finally: body_db.close()
+        job_values = jobs or {}; selected_job = job_values.get(job_id) if job_id else (list(job_values.values())[-1] if job_values else None)
+        return {"timeline": events, "sisters": sisters, "selection": dict(selected) if selected else None,
+                "goal": goal, "verification": verification, "pending_approval": pending,
+                "capability_gap": gap, "conversation": conversation, "job": selected_job}
     finally: connection.close()
 
 
@@ -329,8 +375,10 @@ def serve(data: Path, port: int, *, open_browser: bool = True) -> None:
             self.send_response(200); self.send_header("Content-Type", "text/html; charset=utf-8")
             self.send_header("Content-Length", str(len(body))); self.end_headers(); self.wfile.write(body)
         def do_GET(self) -> None:
-            if self.path == "/api/status":
-                body = json.dumps(read_safe_snapshot(data)).encode()
+            target = urlsplit(self.path)
+            if target.path == "/api/status":
+                job_id = parse_qs(target.query).get("job_id", [None])[0]
+                body = json.dumps(read_safe_snapshot(data, worker.snapshot_jobs(), job_id)).encode()
                 self.send_response(200); self.send_header("Content-Type", "application/json")
                 self.send_header("Content-Length", str(len(body))); self.end_headers(); self.wfile.write(body); return
             self.page()

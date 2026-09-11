@@ -307,7 +307,10 @@ def normalize_a2a_card(card: dict[str, Any]) -> OrganManifest:
 
 
 class ActionLoop:
-    def __init__(self, bus: BodyBus, store: EmbodimentStore): self.bus, self.store, self.resolver = bus, store, CapabilityResolver(bus, store)
+    def __init__(self, bus: BodyBus, store: EmbodimentStore, observer: Any | None = None):
+        self.bus, self.store, self.resolver, self.observer = bus, store, CapabilityResolver(bus, store), observer
+    def _observe(self, kind: str, payload: dict[str, Any]) -> None:
+        if self.observer is not None: self.observer(kind, payload)
     def execute(self, demand: CapabilityDemand, *, lease: PermissionLease | None = None) -> ObservationEnvelope | HumanApprovalRequest | CapabilityGap:
         resolved = self.resolver.resolve(demand)
         if not resolved: return CapabilityGap(**self.store.all("gap")[-1])
@@ -319,14 +322,19 @@ class ActionLoop:
                 "side effect requires Pier approval", scope, demand.risk, organ.cost, organ.side_effect_class,
                 organ.reversible, demand.inputs)
             self.store.put("pending_demand", request.id, {**asdict(demand), "approval_request_id": request.id})
-            self.store.put("approval", request.id, request); return request
+            self.store.put("approval", request.id, request)
+            self._observe("APPROVAL_REQUIRED", {"goal_id": demand.goal_id, "request_id": request.id})
+            return request
         action_id = uuid4().hex
         prediction = Prediction(action_id, demand.goal_id, demand.expected_output, demand.expected_evidence,
                                 demand.confidence, demand.goal_value, demand.information_gain, demand.risk,
                                 organ.cost, time.time(), demand.capability_gain, demand.uncertainty,
                                 demand.decision_provenance_id)
         self.store.put("prediction", action_id, prediction)
+        self._observe("PREDICTION_STORED", {"goal_id": demand.goal_id, "action_id": action_id})
         started = time.time()
+        self._observe("ORGAN_STARTED", {"goal_id": demand.goal_id, "action_id": action_id,
+                                        "organ": organ.id, "operation": operation})
         try:
             result = self.bus.request(organ.id, operation, demand.inputs); success, error = True, None
         except Exception as exc:
@@ -336,7 +344,11 @@ class ActionLoop:
                                           success, result, (f"sha256:{digest}",), organ.provenance, digest, organ.cost,
                                           (finished-started)*1000, organ.side_effect_class, error_class=error,
                                           decision_provenance_id=demand.decision_provenance_id, prediction_id=action_id)
-        self.store.put("observation", action_id, observation); return observation
+        self.store.put("observation", action_id, observation)
+        self._observe("OBSERVATION_RECEIVED", {"goal_id": demand.goal_id, "action_id": action_id,
+                                               "organ": organ.id, "success": success})
+        if not success: self._observe("FAILED", {"goal_id": demand.goal_id, "action_id": action_id, "organ": organ.id})
+        return observation
     def verify(self, observation: ObservationEnvelope, verifier: Any,
                level: VerificationLevel = VerificationLevel.ARTIFACT_VERIFIED) -> bool:
         verified = bool(observation.success and verifier(observation))
@@ -344,7 +356,10 @@ class ActionLoop:
         observation.actual_outcome = "success" if observation.success else "failure"
         prediction = next((p for p in self.store.all("prediction") if p["action_id"] == observation.action_id), None)
         observation.prediction_error = None if verified else f"expected {prediction['expected'] if prediction else 'success'}; observed {observation.actual_outcome}"
-        self.store.put("observation", observation.action_id, observation); return verified
+        self.store.put("observation", observation.action_id, observation)
+        self._observe("VERIFICATION_CHANGED", {"goal_id": observation.goal_id,
+                                               "action_id": observation.action_id, "verified": verified})
+        return verified
     @staticmethod
     def completion(observation: ObservationEnvelope | None) -> str:
         if observation is None: raise ValueError("completion claim requires an ObservationEnvelope")

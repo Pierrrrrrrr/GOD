@@ -8,6 +8,9 @@ import pytest
 from tmco.capabilities import (CapabilityRequest, HumanCheckpoint, OwnerApproval,
                                OwnerCapabilityAuthority, OwnerControlSurface, SetupState)
 from tmco.models import ModelRecord
+from tmco.buses import BodyBus, OrganManifest
+from tmco.embodiment import (ActionLoop, CapabilityDemand, EmbodimentStore,
+                             HumanApprovalRequest, PermissionAuthority)
 from tmco.root import AuthorizationError, RootGuard, RootKernel
 from tmco.vault import CredentialVault
 from tmco.web import App, RuntimeWorker, read_safe_snapshot
@@ -47,7 +50,11 @@ def test_owner_authority_exact_executor_persistent_restart_and_replay(tmp_path: 
                     request(purpose="unrelated")):
         with pytest.raises(AuthorizationError, match="differs"):
             restored.consume(lease, changed, executor_principal=approved.executor_principal)
-    restored.consume(lease, approved, executor_principal=approved.executor_principal)
+    restored.start(lease, approved, executor_principal=approved.executor_principal)
+    assert restored.status(request_id) == SetupState.RUNNING
+    with pytest.raises(AuthorizationError, match="already"):
+        restored.start(lease, approved, executor_principal=approved.executor_principal)
+    restored.complete(request_id, executor_principal=approved.executor_principal)
     restored.close()
 
     replay, _ = authority(tmp_path, clock, root)
@@ -63,21 +70,26 @@ def test_pending_denied_and_paused_exact_checkpoint_survive_restart(tmp_path: Pa
     pending = auth.request(request()); denied = auth.request(replace(request(), workflow_id="denied"))
     auth.decide(auth.owner_control().decide(denied, False))
     lease = auth.decide(auth.owner_control().decide(pending, True)); assert lease
+    auth.start(lease, request(), executor_principal=request().executor_principal)
     auth.pause(pending, HumanCheckpoint.MFA); auth.close()
     restored, _ = authority(tmp_path, clock, root)
     assert restored.status(pending) == SetupState.PAUSED_FOR_PIER
     assert restored.status(denied) == SetupState.DENIED
     with pytest.raises(AuthorizationError, match="exact"):
         restored.resume(restored.owner_control().decide(pending, True), request(scopes=("extra",)))
+    forged_surface = OwnerControlSurface(object())
+    with pytest.raises(AuthorizationError, match="host authority"):
+        restored.resume(forged_surface.decide(pending, True), request())
     restored.resume(restored.owner_control().decide(pending, True), request())
-    assert restored.status(pending) == SetupState.AUTHORIZED
+    assert restored.status(pending) == SetupState.RUNNING
     restored.close()
 
 
 @pytest.mark.parametrize("checkpoint", list(HumanCheckpoint))
 def test_all_human_checkpoints_pause(checkpoint: HumanCheckpoint, tmp_path: Path) -> None:
     auth, _ = authority(tmp_path, [100.0]); identity = auth.request(request())
-    assert auth.decide(auth.owner_control().decide(identity, True))
+    lease = auth.decide(auth.owner_control().decide(identity, True)); assert lease
+    auth.start(lease, request(), executor_principal=request().executor_principal)
     auth.pause(identity, checkpoint)
     assert auth.status(identity) == SetupState.PAUSED_FOR_PIER
     auth.close()
@@ -132,9 +144,38 @@ def test_runtime_worker_exposes_progress_during_long_call(tmp_path: Path, monkey
         time.sleep(.02)
     assert job_id and snapshot["selection"]["model_id"] in {"one", "two"}
     assert any(event["kind"] == "MODEL_SELECTED" for event in snapshot["timeline"])
+    assert snapshot["job"] is None  # direct read without sharing worker job metadata
+    assert any(value and value["status"] == "THINKING" for value in snapshot["sisters"].values())
     assert reply.get(timeout=5)[0]
+    completed = read_safe_snapshot(tmp_path, worker.snapshot_jobs(), job_id)
+    assert completed["job"]["state"] == "COMPLETE" and completed["job"]["result"]
+    assert completed["conversation"][-1]["role"] == "assistant"
     worker.close()
     assert b"never-visible-key" not in (tmp_path / "awakening.sqlite3").read_bytes()
+
+
+def test_action_events_follow_persisted_transition_and_approval_order(tmp_path: Path) -> None:
+    store = EmbodimentStore(tmp_path / "body.sqlite3"); bus = BodyBus(); emitted = []
+    def observer(kind, payload):
+        if kind == "PREDICTION_STORED":
+            assert any(row["action_id"] == payload["action_id"] for row in store.all("prediction"))
+        emitted.append(kind)
+    attempts = []
+    bus.register(OrganManifest("mutator", "openapi", "1", {"mutate": {"required": []}},
+        permissions={"external.mutate"}, side_effect_class="external-mutation", reversible=False,
+        capability_tags={"mutation"}), {"mutate": lambda args: attempts.append(args) or {"ok": True}})
+    loop = ActionLoop(bus, store, observer)
+    demand = CapabilityDemand("goal", "setup", "mutation", "mutate", {}, "changed", risk=1, budget=1)
+    pending = loop.execute(demand)
+    assert isinstance(pending, HumanApprovalRequest)
+    assert emitted == ["APPROVAL_REQUIRED"] and not attempts
+    lease = PermissionAuthority(store).approve(pending.id, approver="Pier")
+    observation = loop.execute(demand, lease=lease)
+    assert emitted == ["APPROVAL_REQUIRED", "PREDICTION_STORED", "ORGAN_STARTED", "OBSERVATION_RECEIVED"]
+    assert attempts and observation.success
+    loop.verify(observation, lambda item: item.success)
+    assert emitted[-1] == "VERIFICATION_CHANGED"
+    store.close()
 
 
 class BootstrapConnector:
