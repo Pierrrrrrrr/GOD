@@ -12,6 +12,12 @@ class ModelProvider(Protocol):
     def infer(self, request: dict[str, Any]) -> dict[str, Any]: ...
 
 
+class TestProvider:
+    """Marker base class for deterministic providers, which are never production organs."""
+
+    test_only = True
+
+
 @dataclass(slots=True)
 class OrganManifest:
     id: str
@@ -24,8 +30,16 @@ class OrganManifest:
 
 
 class ModelBus:
-    def __init__(self, providers: dict[str, ModelProvider] | None = None):
-        self.providers = providers or {}
+    def __init__(self, providers: dict[str, ModelProvider] | None = None, *, production: bool = False):
+        self.production = production
+        self.providers: dict[str, ModelProvider] = {}
+        for name, provider in (providers or {}).items():
+            self.register(name, provider)
+
+    def register(self, name: str, provider: ModelProvider) -> None:
+        if self.production and getattr(provider, "test_only", False):
+            raise ProviderUnavailable("test-only model providers are rejected by the production bus")
+        self.providers[name] = provider
 
     def request(self, provider: str, request: dict[str, Any]) -> dict[str, Any]:
         if provider not in self.providers:
@@ -48,4 +62,3 @@ class BodyBus:
         if handler is None:
             raise ProviderUnavailable(f"organ operation {organ}.{operation} is not configured")
         return handler(arguments)
-

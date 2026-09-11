@@ -17,3 +17,15 @@ PYTHONPATH=src python scripts/demo.py --reset
 
 The demo uses the deterministic fixture in `tmco.fixtures`; production buses never
 substitute a fake provider.
+## Phase 2A awakening (Windows)
+
+Install once with `py -3.11 -m pip install -e .`, then double-click
+`START_GOD.bat`. The server binds only to `127.0.0.1` and opens the local UI at
+`http://127.0.0.1:8765`. Connect OpenRouter, Gemini, or an OpenAI-compatible
+endpoint; credentials are kept in a separate OS/user-protected vault and are
+never displayed after submission.
+
+Normal onboarding requires no model identifier or endpoint: import a local JSON
+secrets file, connect OpenRouter with one key, or detect an existing Ollama
+installation. G.O.D. discovers compatible models and routes them with `AUTO`,
+`FREE FIRST`, or `LOCAL FIRST`; manual configuration remains under Advanced.
