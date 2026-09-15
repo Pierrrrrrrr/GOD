@@ -67,7 +67,8 @@ def test_multistep_goal_restart_exact_continuity_and_true_completion(tmp_path: P
     assert restored.evaluate_outcome(evaluation)
     candidate = restored.advance_goal(goal_id)
     assert candidate["status"] != "completed"
-    goal_check = GoalSuccessVerification(goal_id, "OWNER", ("credible evidence of progress",),
+    goal_check = GoalSuccessVerification(goal_id, "OWNER",
+        tuple(candidate["goal_frame"]["success_criteria"]),
         ("owner-goal-verification",), True, time.time(), "the complete objective is satisfied")
     digest = hashlib.sha256(json.dumps(asdict(goal_check), sort_keys=True,
                             separators=(",", ":")).encode()).hexdigest()
@@ -197,11 +198,12 @@ def test_twin_agree_complementary_and_conflict_semantics(tmp_path: Path) -> None
                                   risk=risk, side_effects="workspace", reversible=reversible)
         return (value, demand, {})
     same = candidate("write")
-    relation, selected = runtime._twin_decision([same, same], views)
+    relation, dependency, selected = runtime._twin_decision([same, same], views)
     assert relation == "AGREE" and len(selected) == 1
-    relation, selected = runtime._twin_decision([candidate("write"), candidate("hash")], views)
+    relation, dependency, selected = runtime._twin_decision([candidate("read"), candidate("hash")], views)
     assert relation == "COMPLEMENTARY" and len(selected) == 2
-    relation, selected = runtime._twin_decision([candidate("write", risk=.8), candidate("delete", risk=.9)], views)
+    assert dependency == "INDEPENDENT"
+    relation, dependency, selected = runtime._twin_decision([candidate("write", risk=.8), candidate("delete", risk=.9)], views)
     assert relation == "CONFLICT" and len(selected) == 1
     runtime.close()
 
@@ -226,5 +228,58 @@ def test_same_step_twin_duplicate_is_consensus_not_stagnation(tmp_path: Path) ->
     advanced = runtime.advance_goal(goal_id)
     assert advanced["twin_decision"] == "AGREE"
     assert advanced["stagnation_count"] == 0
+    selections = runtime.store.rows("SELECT colony,provider,model_id FROM model_selections "
+                                    "WHERE task_class='goal_advance' ORDER BY started_at")
+    assert {row["colony"] for row in selections} == {"Saphira-A", "Saphira-B"}
+    assert {f'{row["provider"]}:{row["model_id"]}' for row in selections} == {"local:free"}
+    assert runtime.organism.colonies["Saphira-A"].id != runtime.organism.colonies["Saphira-B"].id
     assert len([o for o in runtime.embodiment_store.all("observation") if o.get("operation") == "write"]) == 1
     runtime.close()
+
+
+def test_twin_effect_footprints_fail_closed_and_preserve_order(tmp_path: Path) -> None:
+    from tmco.embodiment import CapabilityDemand
+    runtime = make_runtime(tmp_path, GoalProvider()); views = {"Saphira-A": {}, "Saphira-B": {}}
+    def item(operation, path=None, content=None):
+        inputs = {} if path is None else {"path": path}
+        if content is not None: inputs["content"] = content
+        demand = CapabilityDemand("g", "t", "filesystem", operation, inputs, "out",
+            risk=0, side_effects="workspace", reversible=True, information_gain=.5)
+        return (1, demand, {})
+    relation, _, _ = runtime._twin_decision([item("write", "x", "a"), item("delete", "x")], views)
+    assert relation == "CONFLICT"
+    relation, _, _ = runtime._twin_decision([item("write", "x", "a"), item("write", "x", "b")], views)
+    assert relation == "CONFLICT"
+    relation, dependency, _ = runtime._twin_decision([item("read", "x"), item("hash", "x")], views)
+    assert (relation, dependency) == ("COMPLEMENTARY", "INDEPENDENT")
+    research = CapabilityDemand("g", "t", "web", "research", {"url": "https://public.invalid"}, "evidence",
+        risk=0, side_effects="read", reversible=True, information_gain=1)
+    write = CapabilityDemand("g", "t", "filesystem", "write", {"path": "report", "content": "{evidence}"}, "artifact",
+        risk=0, side_effects="workspace", reversible=True, information_gain=.2)
+    relation, dependency, ordered = runtime._twin_decision([(1, write, {}), (1, research, {})], views)
+    assert (relation, dependency) == ("COMPLEMENTARY", "ORDERED_DEPENDENCY")
+    assert ordered[0][1].intent == "research"
+    relation, _, _ = runtime._twin_decision([item("mutate"), item("write")], views)
+    assert relation == "CONFLICT"
+    runtime.close()
+
+
+def test_goalframe_criteria_are_owner_specific_and_restart_immutable(tmp_path: Path) -> None:
+    provider = GoalProvider(); runtime = make_runtime(tmp_path, provider)
+    first_id = runtime.submit_goal("Create report.txt containing alpha", important=False)["goal_id"]
+    second_id = runtime.submit_goal("Research X and return three verified sources", important=False)["goal_id"]
+    import json
+    first = json.loads(runtime.store.rows("SELECT state FROM goals WHERE id=?", (first_id,))[0]["state"])
+    second = json.loads(runtime.store.rows("SELECT state FROM goals WHERE id=?", (second_id,))[0]["state"])
+    assert first["goal_frame"]["success_criteria"] != second["goal_frame"]["success_criteria"]
+    assert "report.txt" in first["goal_frame"]["success_criteria"][0]
+    assert "three verified sources" in second["goal_frame"]["success_criteria"][0]
+    assert any("approved workspace" in item for item in first["goal_frame"]["success_criteria"])
+    assert any("owner-required content: alpha" in item for item in first["goal_frame"]["success_criteria"])
+    assert any("three verified source references" in item for item in second["goal_frame"]["success_criteria"])
+    first_frame = json.dumps(first["goal_frame"], sort_keys=True)
+    runtime.close()
+    restored = make_runtime(tmp_path, GoalProvider())
+    after = json.loads(restored.store.rows("SELECT state FROM goals WHERE id=?", (first_id,))[0]["state"])
+    assert json.dumps(after["goal_frame"], sort_keys=True) == first_frame
+    restored.close()

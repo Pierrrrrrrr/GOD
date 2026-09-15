@@ -3,6 +3,7 @@ import re
 import threading
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from http.server import HTTPServer
 from pathlib import Path
@@ -301,10 +302,11 @@ def test_http_chat_tracks_exact_job_allows_second_message_and_refresh(
             response = json.loads(urllib.request.urlopen(request).read())
             job_id = response["job_id"]
             states = []
-            for _ in range(30):
+            deadline = time.monotonic() + 5
+            while time.monotonic() < deadline:
                 status = json.loads(urllib.request.urlopen(base + "/api/status?job_id=" + job_id).read())
                 states.append(status["job"]["state"])
-                if states[-1] == "COMPLETE": break
+                if states[-1] in {"COMPLETE", "FAILED", "WAITING_FOR_APPROVAL"}: break
                 time.sleep(.02)
             assert states[-1] == "COMPLETE"
         refreshed = urllib.request.urlopen(base + "/").read().decode()
@@ -336,13 +338,121 @@ def test_explicit_http_goal_launch_returns_tracked_durable_goal(tmp_path: Path, 
             headers={"X-GOD-CSRF": token, "Origin": base})
         submitted = json.loads(urllib.request.urlopen(request).read())
         assert submitted["kind"] == "AUTONOMOUS_GOAL"
-        for _ in range(30):
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
             status = json.loads(urllib.request.urlopen(
                 base + "/api/status?job_id=" + submitted["job_id"]).read())
-            if status["job"]["state"] == "COMPLETE": break
+            if status["job"]["state"] in {"COMPLETE", "FAILED", "WAITING_FOR_APPROVAL"}: break
             time.sleep(.02)
         assert status["job"]["result"] == "durable-explicit-goal"
         assert status["goal"]["id"] == "durable-explicit-goal"
         assert status["goal"]["description"] == text
+    finally:
+        server.shutdown(); thread.join(5)
+
+
+def test_strict_failover_never_reselects_attempted_or_ineligible_models(tmp_path: Path) -> None:
+    calls = []
+    class Failing:
+        def infer(self, request): calls.append(request["model_id"]); raise RuntimeError("transient")
+    records = [ModelRecord("p", "a", input_cost=0, output_cost=0, corporate_safe=True),
+               ModelRecord("p", "b", input_cost=0, output_cost=0, corporate_safe=True),
+               ModelRecord("p", "paid", input_cost=1, output_cost=1, corporate_safe=True),
+               ModelRecord("p", "unknown", corporate_safe=True)]
+    runtime = GodRuntime(tmp_path, {"p": Failing()}, records, secret="strict")
+    try:
+        with pytest.raises(Exception, match="NO_FREE_SAFE_INTELLIGENCE_AVAILABLE"):
+            runtime.chat("bounded")
+        assert sorted(calls) == ["a", "b"]
+        assert len(calls) == 2
+    finally: runtime.close()
+
+
+def test_router_strict_exclusion_does_not_use_preference_fallback() -> None:
+    from tmco.models import ExclusionMode, ModelRouter
+    record = ModelRecord("p", "only", input_cost=0, output_cost=0, corporate_safe=True)
+    with pytest.raises(RuntimeError, match="NO_FREE_SAFE_INTELLIGENCE_AVAILABLE"):
+        ModelRouter().choose([record], "conversation", exclude={record.key},
+            exclusion_mode=ExclusionMode.STRICT_EXCLUSION)
+
+
+def test_failover_single_failure_is_called_once_and_twin_preference_can_reuse(tmp_path: Path) -> None:
+    from tmco.models import ExclusionMode, ModelRouter
+    calls = []
+    class Failing:
+        def infer(self, request):
+            calls.append(request["model_id"]); raise RuntimeError("transient")
+    record = ModelRecord("p", "only", input_cost=0, output_cost=0, privacy="local")
+    runtime = GodRuntime(tmp_path, {"p": Failing()}, [record], secret="strict-one")
+    try:
+        with pytest.raises(Exception, match="NO_FREE_SAFE_INTELLIGENCE_AVAILABLE"):
+            runtime.chat("one bounded attempt")
+        assert calls == ["only"]
+    finally:
+        runtime.close()
+    router = ModelRouter()
+    reusable = ModelRecord("p", "only", input_cost=0, output_cost=0, privacy="local")
+    assert router.choose([reusable], "goal_advance", exclude={reusable.key},
+        exclusion_mode=ExclusionMode.PREFER_DISTINCT).key == reusable.key
+    other = ModelRecord("p", "other", input_cost=0, output_cost=0, privacy="local")
+    assert router.choose([reusable, other], "goal_advance", exclude={reusable.key},
+        exclusion_mode=ExclusionMode.PREFER_DISTINCT).key == other.key
+
+
+def test_host_completion_rejection_and_verification_survive_restart(tmp_path: Path) -> None:
+    from test_m1_goal_engine import GoalProvider
+    def attach(app, provider):
+        app.runtime.attach_intelligence({"local": provider},
+            [ModelRecord("local", "free", input_cost=0, output_cost=0, privacy="local")])
+    app = App(tmp_path); attach(app, GoalProvider())
+    goal_id = app.runtime.submit_goal("Create completion proof", important=False)["goal_id"]
+    app.runtime.advance_goal(goal_id); candidate = app.runtime.advance_goal(goal_id)
+    assert candidate["current_step"] == "CANDIDATE_FOR_COMPLETION"
+    evidence = [o["action_id"] for o in app.runtime.embodiment_store.all("observation")
+                if o.get("goal_id") == goal_id and o.get("verification_state") != "UNVERIFIED"]
+    rejected = app.decide_goal_completion(goal_id, False, evidence)
+    assert rejected["status"] == "REPLAN"
+    app.close()
+    restored = App(tmp_path); attach(restored, GoalProvider())
+    state = json.loads(restored.runtime.store.rows("SELECT state FROM goals WHERE id=?", (goal_id,))[0]["state"])
+    assert state["id"] == goal_id and state["status"] == "active" and state["blocker"] == "OBJECTIVE"
+    assert state["goal_frame"]["rejected_completion_claims"]
+    restored.close()
+
+    verify_dir = tmp_path / "verified"; verified_app = App(verify_dir); attach(verified_app, GoalProvider())
+    verified_id = verified_app.runtime.submit_goal("Create verified completion proof", important=False)["goal_id"]
+    verified_app.runtime.advance_goal(verified_id); verified_app.runtime.advance_goal(verified_id)
+    evidence = [o["action_id"] for o in verified_app.runtime.embodiment_store.all("observation")
+                if o.get("goal_id") == verified_id and o.get("verification_state") != "UNVERIFIED"]
+    assert verified_app.decide_goal_completion(verified_id, True, evidence)["status"] == "COMPLETED"
+    verified_app.close()
+    final = App(verify_dir)
+    state = json.loads(final.runtime.store.rows("SELECT state FROM goals WHERE id=?", (verified_id,))[0]["state"])
+    assert state["status"] == "completed" and state["current_step"] == "COMPLETED"
+    final.close()
+
+
+def test_browser_completion_surface_cannot_supply_capability_or_criteria(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    ready = threading.Event(); holder = {}; received = []
+    class ObservableServer(HTTPServer):
+        def server_activate(self):
+            super().server_activate(); holder["server"] = self; ready.set()
+    def decide(self, goal_id, approved, evidence_ids):
+        received.append((goal_id, approved, evidence_ids)); return {"status": "COMPLETED"}
+    monkeypatch.setattr("tmco.web.HTTPServer", ObservableServer)
+    monkeypatch.setattr("tmco.web.App.decide_goal_completion", decide)
+    thread = threading.Thread(target=serve, args=(tmp_path, 0), kwargs={"open_browser": False}); thread.start()
+    assert ready.wait(5); server = holder["server"]; base = f"http://127.0.0.1:{server.server_port}"
+    try:
+        page = urllib.request.urlopen(base + "/").read().decode()
+        assert "OwnerCapability" not in page and "signature" not in page
+        token = re.search(r'name=csrf-token content="([^"]+)"', page).group(1)
+        forged = urllib.parse.urlencode({"goal_id": "g", "decision": "verify", "evidence": "e1,e2",
+            "success_criteria": "attacker criteria", "capability": "forged-signed-value"}).encode()
+        request = urllib.request.Request(base + "/goal-completion", data=forged, method="POST",
+            headers={"X-GOD-CSRF": token, "Origin": base})
+        assert json.loads(urllib.request.urlopen(request).read())["status"] == "COMPLETED"
+        assert received == [("g", True, ["e1", "e2"])]
     finally:
         server.shutdown(); thread.join(5)

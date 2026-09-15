@@ -42,7 +42,11 @@ non-exportable regardless of ordinary disclosure approval.
 ### Durable autonomous goal engine
 
 The production runtime exposes one-step `advance_goal(goal_id)` and bounded
-`run_goal(goal_id, max_steps)`. A durable compact GoalBrief carries the stable owner objective,
+`run_goal(goal_id, max_steps)`. Goal creation persists a versioned GoalFrame containing the
+exact owner intent, desired outcome, explicit constraints, immutable owner-traceable success
+criteria, creation time, current milestone, blocker, evidence references, rejected completion
+claims, next move, and bounded counters. Its immutable fields are integrity-digested and cannot
+be silently loosened by later cognition. A durable compact GoalBrief carries the stable owner objective,
 safe evidence references and hashes, blocker class, step count, attempted-action fingerprints,
 and whether twin escalation is required. Each advance plans at most one bounded stage, invokes
 the existing BodyBus/observation boundary, persists before returning, and never repeats an
@@ -64,6 +68,23 @@ verification bound to the stable success criteria and evidence references. The U
 arbitrary owner text explicitly as chat or as an autonomous goal; phrase inference is not
 required. Gemini remains visibly blocked in Corporate Safe mode while its account-specific
 zero-cost and privacy eligibility cannot be demonstrated.
+
+When a goal reaches `CANDIDATE_FOR_COMPLETION`, the UI shows its stable criteria and verified
+evidence. A CSRF-protected owner decision sends only the goal and evidence identities to the
+trusted host. The host reconstructs the exact verification payload and requests a short-lived,
+zero-cost, non-delegable Root capability bound to its digest, goal, evidence, evaluator, and
+`goal-success-gate` executor. The capability is consumed once; it is never exposed to browser
+JavaScript, cognition, models, or Body organs. Rejection preserves the same goal and evidence,
+records the rejected claim, and resumes replanning rather than creating or failing a goal.
+
+Router exclusions have two explicit meanings. Bounded provider failover uses strict exclusion,
+so an attempted resource cannot be selected again within that call. Independent twin cognition
+prefers a distinct eligible resource but may reuse the same model for two separate, attributed
+Saphira calls when it is the only safe zero-cost capability. Twin comparison uses conservative
+effect footprints (target, read/write/delete semantics, side effects, dependency, reversibility,
+and risk): exact matches agree and execute once, compatible reads/actions are complementary,
+evidence consumers are ordered after producers, and uncertain or conflicting mutations fail
+closed to a single safety-arbitrated action.
 
 ### Root and authority
 

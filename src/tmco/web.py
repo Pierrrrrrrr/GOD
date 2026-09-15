@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import html
 import json
 import sqlite3
@@ -11,13 +12,15 @@ import webbrowser
 import queue
 import secrets
 import socket
+from dataclasses import asdict
 from collections import deque
 from uuid import uuid4
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlsplit
 
-from .awakening import GodRuntime
+from .awakening import GoalSuccessVerification, GodRuntime
+from .capabilities import CapabilityRequest
 from .connectors import (GeminiConnector, OllamaConnector, OpenAICompatibleConnector,
                          OpenRouterConnector, ProviderConnector)
 from .models import HTTPModelProvider, ModelRecord, ModelRouter, ResponseMode
@@ -34,7 +37,7 @@ PAGE = """<!doctype html><html lang=en><head><meta charset=utf-8><meta name=view
 <section class=card><details><summary>Saphira observatory</summary><div id=sisters>{sisters}</div></details></section><section class=card><details open><summary>Development & capabilities</summary><div id=development>No persisted development activity.</div><div id=events class=timeline>{timeline}</div></details></section></aside></main>
 <script nonce="{nonce}">const esc=x=>String(x??'none').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));const csrf=document.querySelector('meta[name=csrf-token]').content;let activeJob=null;let pendingText=null;const chat=document.querySelector('#chat'),send=document.querySelector('#send'),input=document.querySelector('#message'),job=document.querySelector('#job');
 function renderConversation(items){chat.innerHTML=items.length?items.map(x=>`<div class="bubble ${x.role==='user'?'user':'assistant'}">${esc(x.content)}</div>`).join(''):'<div class=empty>No messages yet. Start a conversation or launch a goal.</div>';if(pendingText&&!items.some(x=>x.role==='user'&&x.content===pendingText))chat.innerHTML+=`<div class="bubble user">${esc(pendingText)}</div>`;chat.scrollTop=chat.scrollHeight}
-async function poll(){const q=activeJob?'?job_id='+encodeURIComponent(activeJob):'';const r=await fetch('/api/status'+q,{cache:'no-store'});if(!r.ok)return;const s=await r.json();renderConversation(s.conversation||[]);document.querySelector('#task').innerHTML=s.goal?`<b>${esc(s.goal.description)}</b><br>Goal ID: ${esc(s.goal.id)}<br>Status: ${esc(s.goal.status)}<br>Step: ${esc(s.goal.current_step||s.goal.step_count)}`:'<div class=empty>No autonomous goal launched.</div>';document.querySelector('#events').innerHTML=(s.timeline||[]).slice().reverse().map(e=>`<div class=event><b>${esc(e.kind)}</b><br>${esc(e.summary)}</div>`).join('')||'<div class=empty>No persisted activity.</div>';document.querySelector('#sisters').innerHTML=Object.entries(s.sisters||{}).map(([n,v])=>`<div class=sister><b>${esc(n)}</b><br>${esc(v?.status)} · ${esc(v?.summary)} · confidence ${esc(v?.confidence)}</div>`).join('');const cls=s.selection?.cost_classification||'NO FREE SAFE INTELLIGENCE AVAILABLE';document.querySelector('#resource').innerHTML=`<b>${esc(cls)}</b><br>${esc(s.selection?s.selection.provider+':'+s.selection.model_id:'No model selected')}<br>Privacy: ${esc(s.selection?.provider==='ollama'?'local':'corporate-safe remote only')}`;document.querySelector('#development').textContent=s.capability_gap?'Capability gap: '+(s.capability_gap.reason||'persisted gap'):(s.goal?.current_organ?'Current organ: '+s.goal.current_organ:'No active capability development.');if(s.job){job.textContent=s.job.state+(s.job.error?' — '+s.job.error:'');if(['COMPLETE','FAILED','WAITING_FOR_APPROVAL'].includes(s.job.state)){activeJob=null;pendingText=null;send.disabled=false;input.disabled=false;document.querySelector('#goal-launch').disabled=false;input.focus()}}}
+async function poll(){const q=activeJob?'?job_id='+encodeURIComponent(activeJob):'';const r=await fetch('/api/status'+q,{cache:'no-store'});if(!r.ok)return;const s=await r.json();renderConversation(s.conversation||[]);document.querySelector('#task').innerHTML=s.goal?`<b>${esc(s.goal.description)}</b><br>Goal ID: ${esc(s.goal.id)}<br>Status: ${esc(s.goal.status)}<br>Step: ${esc(s.goal.current_step||s.goal.step_count)}${s.goal.current_step==='CANDIDATE_FOR_COMPLETION'?`<hr><b>Candidate for completion</b><br>Criteria:<br>${(s.goal.goal_frame?.success_criteria||[]).map(esc).join('<br>')}<br>Verified evidence: ${(s.goal_evidence||[]).map(x=>esc(x.operation+' · '+x.verification_state+' · '+x.action_id)).join('<br>')||'none'}<br><button id=verify-goal>VERIFY GOAL COMPLETE</button><button id=reject-goal>REJECT / CONTINUE</button>`:''}`:'<div class=empty>No autonomous goal launched.</div>';if(s.goal?.current_step==='CANDIDATE_FOR_COMPLETION'){const decide=async approved=>{const evidence=(s.goal_evidence||[]).map(x=>x.action_id);const r=await mutate('/goal-completion',{goal_id:s.goal.id,decision:approved?'verify':'reject',evidence:evidence.join(',')});if(r.ok)poll()};document.querySelector('#verify-goal').onclick=()=>decide(true);document.querySelector('#reject-goal').onclick=()=>decide(false)}document.querySelector('#events').innerHTML=(s.timeline||[]).slice().reverse().map(e=>`<div class=event><b>${esc(e.kind)}</b><br>${esc(e.summary)}</div>`).join('')||'<div class=empty>No persisted activity.</div>';document.querySelector('#sisters').innerHTML=Object.entries(s.sisters||{}).map(([n,v])=>`<div class=sister><b>${esc(n)}</b><br>${esc(v?.status)} · ${esc(v?.summary)} · confidence ${esc(v?.confidence)}</div>`).join('');const cls=s.selection?.cost_classification||'NO FREE SAFE INTELLIGENCE AVAILABLE';document.querySelector('#resource').innerHTML=`<b>${esc(cls)}</b><br>${esc(s.selection?s.selection.provider+':'+s.selection.model_id:'No model selected')}<br>Privacy: ${esc(s.selection?.provider==='ollama'?'local':'corporate-safe remote only')}`;document.querySelector('#development').textContent=s.capability_gap?'Capability gap: '+(s.capability_gap.reason||'persisted gap'):(s.goal?.current_organ?'Current organ: '+s.goal.current_organ:'No active capability development.');if(s.job){job.textContent=s.job.state+(s.job.error?' — '+s.job.error:'');if(['COMPLETE','FAILED','WAITING_FOR_APPROVAL'].includes(s.job.state)){activeJob=null;pendingText=null;send.disabled=false;input.disabled=false;document.querySelector('#goal-launch').disabled=false;input.focus()}}}
 async function mutate(url,data){return fetch(url,{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded','X-GOD-CSRF':csrf},body:new URLSearchParams(data)})}document.querySelector('#chat-form').addEventListener('submit',async e=>{e.preventDefault();if(activeJob)return;pendingText=input.value;chat.querySelector('.empty')?.remove();chat.insertAdjacentHTML('beforeend',`<div class="bubble user">${esc(pendingText)}</div>`);chat.scrollTop=chat.scrollHeight;send.disabled=true;input.disabled=true;job.textContent='QUEUED';const r=await mutate('/chat',{message:pendingText});if(r.ok){const data=await r.json();activeJob=data.job_id;input.value='';job.textContent='QUEUED';poll()}else{job.textContent='Request rejected safely';activeJob=null;send.disabled=false;input.disabled=false}});document.querySelector('#goal-launch').addEventListener('click',async()=>{if(activeJob||!input.value)return;pendingText=input.value;send.disabled=true;input.disabled=true;document.querySelector('#goal-launch').disabled=true;job.textContent='QUEUED GOAL';const r=await mutate('/goal',{message:pendingText});if(r.ok){const data=await r.json();activeJob=data.job_id;input.value='';poll()}else{job.textContent='Goal launch rejected safely';activeJob=null;send.disabled=false;input.disabled=false;document.querySelector('#goal-launch').disabled=false}});document.querySelector('#doctor-run').addEventListener('click',async()=>{const b=document.querySelector('#doctor-run');b.disabled=true;const r=await mutate('/doctor',{synthetic:'true'});const data=await r.json();document.querySelector('#doctor').innerHTML=data.models.map(m=>`<div class=doctor-row><b>${esc(m.provider+':'+m.model)}</b><br>${esc(m.cost_classification)} · ${esc(m.health)} · ${esc(m.location)}<br>TEXT ${esc(m.text)} · STRUCTURED ${esc(m.structured)} · ${esc(m.failure_class||'no failure')}</div>`).join('')||'<div class=empty>NO FREE SAFE INTELLIGENCE AVAILABLE</div>';b.disabled=false;poll()});document.querySelectorAll('form:not(#chat-form)').forEach(f=>f.addEventListener('submit',async e=>{e.preventDefault();const r=await mutate(f.action,new FormData(f));if(r.ok)location.reload()}));setInterval(poll,600);poll();</script></body></html>"""
 
 
@@ -338,6 +341,48 @@ class App:
         return (self.runtime.advance_goal(goal_id) if max_steps == 1
                 else self.runtime.run_goal(goal_id, max_steps=max_steps))
 
+    def decide_goal_completion(self, goal_id: str, approved: bool,
+                               evidence_ids: list[str]) -> dict[str, object]:
+        rows = self.runtime.store.rows("SELECT state FROM goals WHERE id=?", (goal_id,))
+        if not rows: raise KeyError("unknown goal")
+        state = json.loads(rows[0]["state"])
+        if state.get("current_step") != "CANDIDATE_FOR_COMPLETION":
+            raise ValueError("goal is not awaiting completion verification")
+        observations = {item["action_id"]: item for item in self.runtime.embodiment_store.all("observation")
+                        if item.get("goal_id") == goal_id and item.get("verification_state") != "UNVERIFIED"}
+        evidence_refs = tuple(sorted(set(evidence_ids)))
+        if not evidence_refs or any(identity not in observations for identity in evidence_refs):
+            raise ValueError("completion evidence must reference verified goal observations")
+        reason = ("Pier verified the stable goal criteria" if approved
+                  else "Pier rejected the completion claim; continue toward the objective")
+        verification = GoalSuccessVerification(goal_id, "OWNER",
+            tuple(state["goal_frame"]["success_criteria"]), evidence_refs, approved, time.time(), reason)
+        digest = hashlib.sha256(json.dumps(asdict(verification), sort_keys=True,
+                                           separators=(",", ":")).encode()).hexdigest()
+        request = CapabilityRequest(self.runtime.organism.root.owner, "goal-verification", "OWNER",
+            f"verification of stable goal {goal_id}", digest, "goal-success-gate",
+            "goal-success-verification", goal_id, allowed_submitted_data=evidence_refs,
+            maximum_cost=0, ttl_seconds=120, non_delegable=True)
+        request_id = self.runtime.owner_capabilities.request(request)
+        decision = self.runtime.owner_capabilities.owner_control().decide(request_id, True)
+        capability = self.runtime.owner_capabilities.decide(decision)
+        if capability is None: raise PermissionError("owner authorization was not issued")
+        result = self.runtime.verify_goal_success(verification, capability)
+        if not approved:
+            fresh = json.loads(self.runtime.store.rows("SELECT state FROM goals WHERE id=?", (goal_id,))[0]["state"])
+            frame = fresh["goal_frame"]; claims = frame.setdefault("rejected_completion_claims", [])
+            claim = {"evidence_refs": list(evidence_refs), "timestamp": verification.timestamp,
+                     "reason": reason}
+            if claims and claims[-1]["evidence_refs"] == claim["evidence_refs"]:
+                fresh["stagnation_count"] = fresh.get("stagnation_count", 0) + 1
+            claims.append(claim)
+            fresh.update(status="active", current_step="REPLAN", blocker="OBJECTIVE",
+                         completion_requested=False, escalate_twin=True)
+            frame.update(current_milestone="REPLAN", blocker="OBJECTIVE")
+            self.runtime.store.put("goals", goal_id, fresh)
+        return {"goal_id": goal_id, "verified": result,
+                "status": "COMPLETED" if result else "REPLAN"}
+
     def close(self) -> None:
         self.runtime.close()
 
@@ -436,7 +481,7 @@ def read_safe_snapshot(data: Path, jobs: dict[str, dict[str, object]] | None = N
         goal_row = connection.execute("SELECT state FROM goals ORDER BY rowid DESC LIMIT 1").fetchone()
         goal = json.loads(goal_row[0]) if goal_row else None
         conversation = [dict(row) for row in connection.execute("SELECT role,content,created FROM chat ORDER BY id")]
-        verification = None
+        verification = None; goal_evidence = []
         pending = gap = None
         body = data / "embodiment.sqlite3"
         if body.exists():
@@ -445,6 +490,12 @@ def read_safe_snapshot(data: Path, jobs: dict[str, dict[str, object]] | None = N
                 approval = body_db.execute("SELECT state FROM body WHERE kind='approval' ORDER BY rowid DESC LIMIT 1").fetchone()
                 gap_row = body_db.execute("SELECT state FROM body WHERE kind='gap' ORDER BY rowid DESC LIMIT 1").fetchone()
                 observation = body_db.execute("SELECT state FROM body WHERE kind='observation' ORDER BY rowid DESC LIMIT 1").fetchone()
+                if goal:
+                    for row in body_db.execute("SELECT state FROM body WHERE kind='observation' ORDER BY rowid"):
+                        item = json.loads(row[0])
+                        if item.get("goal_id") == goal.get("id") and item.get("verification_state") != "UNVERIFIED":
+                            goal_evidence.append({key: item.get(key) for key in
+                                ("action_id", "operation", "verification_state", "content_hash", "evidence_refs")})
                 approval_data = json.loads(approval[0]) if approval else None
                 pending = ({key: approval_data.get(key) for key in
                             ("id", "goal_id", "organ", "operation", "reason", "scope", "risk", "cost",
@@ -456,7 +507,8 @@ def read_safe_snapshot(data: Path, jobs: dict[str, dict[str, object]] | None = N
         job_values = jobs or {}; selected_job = job_values.get(job_id) if job_id else (list(job_values.values())[-1] if job_values else None)
         return {"timeline": events, "sisters": sisters, "selection": selected_view,
                 "goal": goal, "verification": verification, "pending_approval": pending,
-                "capability_gap": gap, "conversation": conversation, "job": selected_job}
+                "capability_gap": gap, "conversation": conversation, "job": selected_job,
+                "goal_evidence": goal_evidence}
     finally: connection.close()
 
 
@@ -551,6 +603,13 @@ def serve(data: Path, port: int, *, open_browser: bool = True) -> None:
                     job_id, _ = worker.submit("launch_goal", fields["message"])
                     body = json.dumps({"job_id": job_id, "status": "QUEUED", "kind": "AUTONOMOUS_GOAL"}).encode()
                     self.send_response(202); self._security_headers(); self.send_header("Content-Type", "application/json")
+                    self.send_header("Content-Length", str(len(body))); self.end_headers(); self.wfile.write(body); return
+                if self.path == "/goal-completion":
+                    evidence_ids = [item for item in fields.get("evidence", "").split(",") if item]
+                    result = worker.call("decide_goal_completion", fields.get("goal_id", ""),
+                                         fields.get("decision") == "verify", evidence_ids)
+                    body = json.dumps(result).encode()
+                    self.send_response(200); self._security_headers(); self.send_header("Content-Type", "application/json")
                     self.send_header("Content-Length", str(len(body))); self.end_headers(); self.wfile.write(body); return
                 if self.path == "/doctor":
                     models = worker.call("find_working_free_intelligence")

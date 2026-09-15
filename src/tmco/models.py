@@ -29,6 +29,11 @@ class ResponseMode(str, Enum):
     STRUCTURED = "structured"
 
 
+class ExclusionMode(str, Enum):
+    STRICT_EXCLUSION = "STRICT_EXCLUSION"
+    PREFER_DISTINCT = "PREFER_DISTINCT"
+
+
 @dataclass(slots=True)
 class ModelRecord:
     provider: str
@@ -183,6 +188,7 @@ class ModelRouter:
 
     def choose(self, records: list[ModelRecord], task: str, *, privacy: bool = False,
                exclude: set[str] | None = None, policy: str = "ZERO_COST",
+               exclusion_mode: ExclusionMode = ExclusionMode.PREFER_DISTINCT,
                requires_tools: bool = False, min_context: int = 0,
                required_modality: str = "text") -> ModelRecord:
         candidates = [r for r in records if r.retry_eligible() and r.zero_cost_eligible
@@ -192,7 +198,7 @@ class ModelRouter:
                       and (task == "conversation" or r.structured_capability)
                       and (r.context_capability is None or r.context_capability >= min_context)
                       and required_modality in r.modalities]
-        if not candidates:
+        if not candidates and exclusion_mode is ExclusionMode.PREFER_DISTINCT:
             candidates = [r for r in records if r.retry_eligible() and r.zero_cost_eligible
                           and (r.privacy == "local" or r.corporate_safe)
                           and (not requires_tools or r.tool_capability)
