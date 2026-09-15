@@ -5,13 +5,13 @@ import json
 import sqlite3
 import time
 import hashlib
-from dataclasses import asdict
+from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
 from uuid import uuid4
 
 from .buses import BodyBus, ModelBus, ModelProvider, OrganManifest, ProviderUnavailable
-from .capabilities import OwnerCapabilityAuthority
+from .capabilities import OwnerCapability, OwnerCapabilityAuthority
 from .embodiment import (ActionLoop, CapabilityDemand, CapabilityResolver, EmbodimentStore,
                          DecisionProvenance, HumanApprovalRequest, ObservationEnvelope,
                          OrganRegistry, OutcomeEvaluation, OutcomeEvaluator, PermissionAuthority,
@@ -26,6 +26,17 @@ from .system import TMCOSystem
 from .types import ActionCandidate, ComputeBudget, Goal, GoalStatus
 from .sisters import (BriefResponse, DigestResponse, SisterBrief, SisterDevelopmentDigest,
                       SisterExchangePolicy, SisterView, WorkClass, classify_work)
+
+
+@dataclass(frozen=True, slots=True)
+class GoalSuccessVerification:
+    goal_id: str
+    evaluator: str
+    success_criteria: tuple[str, ...]
+    evidence_refs: tuple[str, ...]
+    verified: bool
+    timestamp: float
+    reason: str
 
 
 class AwakeningStore:
@@ -49,6 +60,9 @@ class AwakeningStore:
         CREATE TABLE IF NOT EXISTS sister_states(
           sequence INTEGER PRIMARY KEY AUTOINCREMENT,colony TEXT,goal_id TEXT,status TEXT,
           summary TEXT,confidence REAL,created REAL);
+        CREATE TABLE IF NOT EXISTS goal_success_verifications(
+          id INTEGER PRIMARY KEY AUTOINCREMENT, goal_id TEXT NOT NULL,
+          state TEXT NOT NULL, created REAL NOT NULL);
         """)
         self.connection.commit()
 
@@ -101,6 +115,11 @@ class AwakeningStore:
                      confidence: float | None) -> None:
         self.connection.execute("INSERT INTO sister_states(colony,goal_id,status,summary,confidence,created) VALUES(?,?,?,?,?,?)",
                                 (colony, goal_id, status, summary, confidence, time.time())); self.connection.commit()
+
+    def goal_verification(self, verification: GoalSuccessVerification) -> None:
+        self.connection.execute("INSERT INTO goal_success_verifications(goal_id,state,created) VALUES(?,?,?)",
+                                (verification.goal_id, json.dumps(asdict(verification)), verification.timestamp))
+        self.connection.commit()
 
 
 class ModelBackedCognition(Cognition):
@@ -196,6 +215,7 @@ class GodRuntime:
         self.permission_authority = PermissionAuthority(self.embodiment_store)
         self.owner_capabilities = OwnerCapabilityAuthority(self.organism.root,
                                                            directory / "owner_capabilities.sqlite3")
+        self.bus.outbound_policy.authority = self.owner_capabilities
         self.sister_exchange = SisterExchangePolicy()
         self._restore_exchange_rounds()
         self._register_builtin_organs(web_test_allow_hosts)
@@ -335,6 +355,7 @@ class GodRuntime:
     def attach_intelligence(self, providers: dict[str, ModelProvider],
                             records: list[ModelRecord], *, configuration_changed: bool = False) -> None:
         bus = ModelBus(providers, production=True)
+        bus.outbound_policy.authority = self.owner_capabilities
         configured = {record.key: record for record in records}
         if not configured:
             raise ProviderUnavailable("at least one model record is required")
@@ -365,6 +386,7 @@ class GodRuntime:
 
     def detach_intelligence(self) -> None:
         self.bus = ModelBus(production=True)
+        self.bus.outbound_policy.authority = self.owner_capabilities
         self.records = {}
         self.cognition = DisconnectedCognition()
         self.organism.executive.cognition = self.cognition
@@ -547,8 +569,9 @@ class GodRuntime:
                  "episode_id": episode["id"], "work_class": work_class.value, "current_step": "reasoning",
                  "selected_colony": primary_colony,
                  "current_organ": None, "last_observation": None, "exchange_status": "completed" if exchange else "none",
-                 "step_count": 1, "attempted_actions": [], "stagnation_count": 0,
-                 "blocker": None, "verified_evidence": [], "last_consumed_observation": None}
+                 "step_count": 1, "action_ledger": {}, "stagnation_count": 0,
+                 "blocker": None, "verified_evidence": [], "last_consumed_observation": None,
+                 "success_criteria": list(goal.success_criteria)}
         self.store.put("goals", goal_id, state)
         self.store.put("episodes", episode["id"], episode)
         self._learn_neurons(decisions, text)
@@ -577,6 +600,65 @@ class GodRuntime:
 
     BLOCKER_CLASSES = {"INFORMATION", "CAPABILITY", "PERMISSION", "PROVIDER",
                        "STRATEGY", "OBJECTIVE", "EXECUTION"}
+    ACTION_LEDGER_STATES = {"PROPOSED", "WAITING_APPROVAL", "EXECUTING", "OBSERVED",
+                            "VERIFIED", "FAILED", "RETRYABLE", "SUPERSEDED"}
+    GOAL_VERIFIERS = {"OWNER", "REGISTERED_VERIFIER", "OBJECTIVE_TEST"}
+
+    def verify_goal_success(self, verification: GoalSuccessVerification,
+                            capability: OwnerCapability) -> bool:
+        rows = self.store.rows("SELECT state FROM goals WHERE id=?", (verification.goal_id,))
+        if not rows: raise KeyError("unknown goal")
+        state = json.loads(rows[0]["state"])
+        if verification.evaluator not in self.GOAL_VERIFIERS:
+            raise PermissionError("untrusted goal verifier")
+        if tuple(state.get("success_criteria", ())) != verification.success_criteria:
+            raise ValueError("goal verification criteria do not match the stable goal")
+        if not verification.evidence_refs:
+            raise ValueError("goal verification requires evidence references")
+        request = capability.request
+        verification_digest = hashlib.sha256(json.dumps(
+            asdict(verification), sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+        if (request.service != "goal-verification" or request.operation != verification.evaluator
+                or request.account_id != verification.goal_id
+                or request.allowed_submitted_data != verification.evidence_refs
+                or request.workflow_id != verification_digest
+                or request.executor_principal != "goal-success-gate" or request.maximum_cost != 0):
+            raise PermissionError("goal verification capability scope mismatch")
+        self.owner_capabilities.start(capability, request, executor_principal="goal-success-gate")
+        self.store.goal_verification(verification)
+        self._event("GOAL_SUCCESS_VERIFIED" if verification.verified else "GOAL_SUCCESS_REJECTED",
+                    "Trusted goal-level verification recorded", {"goal_id": verification.goal_id,
+                    "evaluator": verification.evaluator, "verified": verification.verified})
+        return verification.verified
+
+    @staticmethod
+    def _action_identity(demand: CapabilityDemand) -> str:
+        canonical = {"capability": demand.required_capability, "intent": demand.intent,
+                     "inputs": demand.inputs, "expected_output": demand.expected_output,
+                     "expected_evidence": demand.expected_evidence,
+                     "side_effect_class": demand.side_effects,
+                     "reversible": demand.reversible}
+        return hashlib.sha256(json.dumps(canonical, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+
+    def _twin_decision(self, candidates: list[tuple[float, CapabilityDemand, dict[str, Any]]],
+                       interpretations: dict[str, dict[str, Any]]) -> tuple[str, list[tuple[float, CapabilityDemand, dict[str, Any]]]]:
+        if len(interpretations) < 2:
+            return "SINGLE", candidates
+        by_fingerprint: dict[str, list[tuple[float, CapabilityDemand, dict[str, Any]]]] = {}
+        for candidate in candidates:
+            by_fingerprint.setdefault(self._action_identity(candidate[1]), []).append(candidate)
+        if not by_fingerprint:
+            return "AGREE", []
+        if len(by_fingerprint) == 1:
+            return "AGREE", [max(next(iter(by_fingerprint.values())), key=lambda item: item[0])]
+        distinct = [max(group, key=lambda item: item[0]) for group in by_fingerprint.values()]
+        compatible = (len({item[1].intent for item in distinct}) == len(distinct)
+                      and all(item[1].reversible and item[1].risk <= .25 for item in distinct)
+                      and sum(item[0] for item in distinct) > 0)
+        if compatible:
+            return "COMPLEMENTARY", sorted(distinct, key=lambda item: -item[0])
+        # Conflict is arbitrated by explicit utility; do not execute both.
+        return "CONFLICT", [max(distinct, key=lambda item: (item[0], self._action_identity(item[1])))]
 
     def advance_goal(self, goal_id: str) -> dict[str, Any]:
         """Advance one bounded, durable goal step without replaying verified actions."""
@@ -587,6 +669,12 @@ class GodRuntime:
             return state
         if state.get("status") == "budget_exhausted":
             state["status"] = "active"
+        uncertain_actions = [entry for entry in state.get("action_ledger", {}).values()
+                             if entry.get("status") == "EXECUTING"]
+        if uncertain_actions:
+            state.update(status="blocked", blocker="EXECUTION", current_step="BLOCKED")
+            self.store.put("goals", goal_id, state)
+            return state
         if state.get("pending_approval"):
             state.update(status="waiting_owner", blocker="PERMISSION")
             self.store.put("goals", goal_id, state); return state
@@ -601,9 +689,13 @@ class GodRuntime:
         positive = [item for item in observations if evaluations.get(item.get("action_id"), {}).get("correct")]
         negative = [item for item in observations if item.get("action_id") in evaluations
                     and not evaluations[item["action_id"]].get("correct")]
-        if positive and state.get("completion_requested"):
+        goal_checks = [json.loads(row["state"]) for row in self.store.rows(
+            "SELECT state FROM goal_success_verifications WHERE goal_id=? ORDER BY id", (goal_id,))]
+        trusted_goal_checks = [check for check in goal_checks if check.get("verified")]
+        goal_verified = bool(trusted_goal_checks)
+        if goal_verified and state.get("completion_requested"):
             state.update(status="completed", current_step="COMPLETED", blocker=None,
-                         verified_evidence=[item["action_id"] for item in positive])
+                         verified_evidence=trusted_goal_checks[-1]["evidence_refs"])
             self.store.put("goals", goal_id, state)
             self._event("GOAL_COMPLETED", "Goal completed from downstream verified outcome", {"goal_id": goal_id})
             return state
@@ -637,17 +729,30 @@ class GodRuntime:
         chosen = next(iter(interpretations.values()))["argument"]
         demands = self._structured_demands(goal_id, state.get("episode_id") or uuid4().hex,
                                            state["description"], interpretations, [])
-        attempted = set(state.get("attempted_actions", [])); unique = []
-        for candidate in demands:
-            fingerprint = hashlib.sha256(json.dumps(
-                {"intent": candidate[1].intent, "inputs": candidate[1].inputs}, sort_keys=True).encode()).hexdigest()
-            if fingerprint in attempted:
-                state["stagnation_count"] = state.get("stagnation_count", 0) + 1
-            else:
-                attempted.add(fingerprint); unique.append(candidate)
+        twin_decision, selected_demands = self._twin_decision(demands, interpretations)
+        state["twin_decision"] = twin_decision
+        state["twin_decision_facts"] = {"relation": twin_decision,
+            "lineages": sorted(interpretations), "proposal_count": len(demands),
+            "selected_fingerprints": [self._action_identity(item[1]) for item in selected_demands]}
+        ledger = state.setdefault("action_ledger", {})
+        prior_evidence_count = len(observations)
+        causal_step = state.get("step_count", 1) + 1
+        unique = []
+        for candidate in selected_demands:
+            fingerprint = self._action_identity(candidate[1])
+            prior = ledger.get(fingerprint)
+            if prior and prior.get("step") != causal_step:
+                meaningful_change = prior.get("evidence_count", 0) != prior_evidence_count
+                if not meaningful_change:
+                    state["stagnation_count"] = state.get("stagnation_count", 0) + 1
+                else:
+                    prior["evidence_count"] = prior_evidence_count
+                continue
+            unique.append(candidate)
+        state["_current_causal_step"] = causal_step
         body = self._run_body_plan(state, unique, interpretations) if unique else None
-        state["attempted_actions"] = sorted(attempted)
-        state["step_count"] = state.get("step_count", 1) + 1
+        state.pop("_current_causal_step", None)
+        state["step_count"] = causal_step
         state["next_action"] = chosen.get("next_useful_action")
         state["completion_requested"] = chosen.get("completion_requested") is True
         proposed_blocker = str(chosen.get("blocker") or "").upper()
@@ -655,8 +760,10 @@ class GodRuntime:
             proposed_blocker if proposed_blocker in self.BLOCKER_CLASSES else None)
         state["escalate_twin"] = (float(chosen.get("uncertainty", 0)) >= .5
                                   or float(chosen.get("risk", 0)) >= .4
-                                  or state["completion_requested"] and not positive)
-        state["current_step"] = "METACOGNITION" if state.get("stagnation_count") else state.get("current_step", "REPLAN")
+                                  or state["completion_requested"] and not goal_verified)
+        state["current_step"] = ("METACOGNITION" if state.get("stagnation_count") else
+                                 "CANDIDATE_FOR_COMPLETION" if state["completion_requested"] else
+                                 state.get("current_step", "REPLAN"))
         if state.get("stagnation_count", 0) >= 3:
             state.update(status="blocked", current_step="BLOCKED", blocker="STRATEGY")
         elif body and body.get("status") == "pending_approval":
@@ -766,11 +873,24 @@ class GodRuntime:
 
     def _run_body_plan(self, state: dict[str, Any], candidates: list[tuple[float, CapabilityDemand, dict[str, Any]]], interpretations: dict[str, dict[str, Any]]) -> dict[str, Any]:
         observations = []; evidence = ""
+        ledger = state.setdefault("action_ledger", {})
         # Execute the best candidate per intent in utility order, permitting research then save.
         seen = set()
         for _, demand, raw in candidates:
             if demand.intent in seen: continue
             seen.add(demand.intent)
+            fingerprint = self._action_identity(demand)
+            existing = ledger.get(fingerprint)
+            if existing and existing.get("status") in {"OBSERVED", "VERIFIED", "FAILED", "EXECUTING", "WAITING_APPROVAL"}:
+                # EXECUTING after a crash is deliberately not retried: the host
+                # cannot prove the prior side effect did not occur.
+                continue
+            ledger[fingerprint] = {"fingerprint": fingerprint, "status": "PROPOSED",
+                "step": state.get("_current_causal_step", state.get("step_count", 1)),
+                "evidence_count": len(self.embodiment_store.all("observation")),
+                "capability": demand.required_capability, "intent": demand.intent,
+                "reversible": demand.reversible, "action_id": None}
+            self.store.put("goals", state["id"], state)
             winner = None
             provenance = next((item for item in self.embodiment_store.all("decision_provenance")
                                if item["id"] == demand.decision_provenance_id), {})
@@ -788,29 +908,39 @@ class GodRuntime:
                 winner = self._develop_gap(demand, interpretations)
                 resolved = self.capability_resolver.resolve(demand) if winner is not None else None
                 if resolved is None:
+                    ledger[fingerprint]["status"] = "RETRYABLE"
+                    self.store.put("goals", state["id"], state)
                     return {"status":"gap"}
                 state.update(current_step="body_execution", current_organ=resolved[0].id)
                 self.store.put("goals", state["id"], state)
                 self._event("CAPABILITY_RESOLVED", f"Developed demand resolved to {resolved[0].id}",
                             {"goal_id": state["id"], "organ": resolved[0].id, "demand_id": demand.id})
+            ledger[fingerprint]["status"] = "EXECUTING"
+            self.store.put("goals", state["id"], state)
             result = self.action_loop.execute(demand)
             if isinstance(result, HumanApprovalRequest):
+                ledger[fingerprint].update(status="WAITING_APPROVAL", approval_request_id=result.id)
                 state.update(current_step="pending_approval", pending_approval=result.id); self.store.put("goals",state["id"],state)
                 if acting_colony: self._sister_transition(acting_colony, state["id"], "WAITING", "Waiting for Pier approval")
                 return {"status":"pending_approval","request":asdict(result)}
             if not isinstance(result, ObservationEnvelope):
+                ledger[fingerprint]["status"] = "FAILED"
                 state.update(current_step="capability_gap"); self.store.put("goals",state["id"],state)
                 return {"status":"gap"}
+            ledger[fingerprint].update(status="OBSERVED", action_id=result.action_id)
+            self.store.put("goals", state["id"], state)
             if acting_colony: self._sister_transition(acting_colony, state["id"], "ACTING", "Body operation invoked")
             if acting_colony: self._sister_transition(acting_colony, state["id"], "VERIFYING", "Checking body observation")
             level = VerificationLevel.TRANSPORT_VERIFIED if demand.required_capability == "web" else VerificationLevel.ARTIFACT_VERIFIED
             verified = self.action_loop.verify(result, lambda obs: obs.success and bool(obs.content_hash), level)
             if not result.success:
+                ledger[fingerprint]["status"] = "FAILED"
                 state.update(status="failed", current_step="FAILED", last_observation=result.action_id)
                 self.store.put("goals", state["id"], state)
                 if acting_colony: self._sister_transition(acting_colony, state["id"], "BLOCKED", "Body invocation failed")
                 return {"status": "failed", "observations": [asdict(result)]}
             if verified:
+                ledger[fingerprint]["status"] = "VERIFIED"
                 manifest = self.body_bus.manifests[result.organ]
                 manifest.verified_reliability = min(1, manifest.verified_reliability + .01)
                 if winner is not None:
@@ -988,6 +1118,9 @@ class GodRuntime:
             goal_rows = self.store.rows("SELECT state FROM goals WHERE id=?", (request["goal_id"],))
             if goal_rows:
                 state = json.loads(goal_rows[0]["state"])
+                for entry in state.get("action_ledger", {}).values():
+                    if entry.get("approval_request_id") == request_id:
+                        entry["status"] = "SUPERSEDED"
                 state.update(status="blocked", current_step="DENIED", pending_approval=None)
                 self.store.put("goals", state["id"], state)
             return
@@ -1004,6 +1137,10 @@ class GodRuntime:
         if isinstance(result, ObservationEnvelope):
             level = VerificationLevel.TRANSPORT_VERIFIED if manifest.kind == "web" else VerificationLevel.ARTIFACT_VERIFIED
             self.action_loop.verify(result, lambda observation: observation.success and bool(observation.content_hash), level)
+            for entry in state.get("action_ledger", {}).values():
+                if entry.get("approval_request_id") == request_id:
+                    entry.update(status="VERIFIED" if result.success else "FAILED",
+                                 action_id=result.action_id)
             state.update(status="awaiting_outcome", current_step="AWAITING_OUTCOME", current_organ=request["organ"],
                          last_observation=result.action_id, pending_approval=None)
             self.store.put("goals", state["id"], state)

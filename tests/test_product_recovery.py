@@ -224,20 +224,48 @@ def test_openrouter_requests_enforce_corporate_safe_provider_route(monkeypatch: 
     assert sent[0]["response_format"] == {"type": "json_object"}
 
 
-def test_outbound_data_policy_blocks_private_remote_context() -> None:
-    from tmco.buses import ModelBus
-    from tmco.data_policy import DataClass, DisclosureApproval
+def test_outbound_data_policy_blocks_private_remote_context(tmp_path: Path) -> None:
+    from tmco.capabilities import CapabilityRequest, OwnerCapability
+    from tmco.data_policy import DataClass
 
     calls = []
     provider = type("Remote", (), {"privacy": "remote", "infer": lambda self, request: calls.append(request) or {}})()
-    bus = ModelBus({"remote": provider}, production=True)
+    runtime = GodRuntime(tmp_path, {"remote": provider},
+        [ModelRecord("remote", "free", input_cost=0, output_cost=0, corporate_safe=True)], secret="disclosure")
+    bus = runtime.bus
+    bus.register("other", provider)
     with pytest.raises(PermissionError):
         bus.request("remote", {"data_classes": [DataClass.CREDENTIAL.value]})
     with pytest.raises(PermissionError):
         bus.request("remote", {"data_classes": [DataClass.WORKSPACE_PRIVATE.value], "artifact_id": "a"})
-    bus.request("remote", {"data_classes": [DataClass.WORKSPACE_PRIVATE.value], "artifact_id": "a",
-                           "disclosure_approval": DisclosureApproval("pier-1", "a")})
+    request = CapabilityRequest(runtime.organism.root.owner, "remote", "disclose_workspace", "summarize", "workflow",
+        "outbound-data-policy", "workspace-disclosure", "artifact-a",
+        allowed_submitted_data=("hash-a",), maximum_cost=0, ttl_seconds=60)
+    request_id = runtime.owner_capabilities.request(request)
+    capability = runtime.owner_capabilities.decide(
+        runtime.owner_capabilities.owner_control().decide(request_id, True))
+    assert capability is not None
+    common = {"data_classes": [DataClass.WORKSPACE_PRIVATE.value], "artifact_id": "artifact-a",
+              "content_hash": "hash-a", "outbound_purpose": "summarize"}
+    for changed in ({"artifact_id": "wrong"}, {"content_hash": "altered"},
+                    {"outbound_purpose": "other"}):
+        with pytest.raises(PermissionError):
+            bus.request("remote", {**common, **changed, "disclosure_approval": capability})
+    forged = OwnerCapability(capability.request_id, capability.request, capability.expires_at,
+                             capability.nonce, "0" * 64)
+    with pytest.raises(PermissionError):
+        bus.request("remote", {**common, "disclosure_approval": forged})
+    with pytest.raises(PermissionError):
+        bus.request("other", {**common, "disclosure_approval": capability})
+    expired = OwnerCapability(capability.request_id, capability.request, 0, capability.nonce,
+                              capability.signature)
+    with pytest.raises(PermissionError):
+        bus.request("remote", {**common, "disclosure_approval": expired})
+    bus.request("remote", {**common, "disclosure_approval": capability})
+    with pytest.raises(PermissionError):
+        bus.request("remote", {**common, "disclosure_approval": capability})
     assert len(calls) == 1
+    runtime.close()
 
 
 def test_startup_and_intelligence_doctor_are_redacted(tmp_path: Path) -> None:
@@ -281,5 +309,40 @@ def test_http_chat_tracks_exact_job_allows_second_message_and_refresh(
             assert states[-1] == "COMPLETE"
         refreshed = urllib.request.urlopen(base + "/").read().decode()
         assert "first" in refreshed and "second" in refreshed
+    finally:
+        server.shutdown(); thread.join(5)
+
+
+def test_explicit_http_goal_launch_returns_tracked_durable_goal(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    ready = threading.Event(); holder = {}
+    class ObservableServer(HTTPServer):
+        def server_activate(self):
+            super().server_activate(); holder["server"] = self; ready.set()
+    def launch(self, message):
+        goal_id = "durable-explicit-goal"
+        self.runtime.store.put("goals", goal_id, {"id": goal_id, "description": message,
+            "status": "active", "current_step": "reasoning", "step_count": 1})
+        return goal_id
+    monkeypatch.setattr("tmco.web.HTTPServer", ObservableServer)
+    monkeypatch.setattr("tmco.web.App.launch_goal", launch)
+    thread = threading.Thread(target=serve, args=(tmp_path, 0), kwargs={"open_browser": False}); thread.start()
+    assert ready.wait(5); server = holder["server"]; base = f"http://127.0.0.1:{server.server_port}"
+    try:
+        page = urllib.request.urlopen(base + "/").read().decode()
+        assert "Run as autonomous goal" in page and "COST OR PRIVACY NOT PROVEN — BLOCKED" in page
+        token = re.search(r'name=csrf-token content="([^"]+)"', page).group(1)
+        text = "Analizza questo problema e trova una soluzione"
+        request = urllib.request.Request(base + "/goal", data=("message=" + text).encode(), method="POST",
+            headers={"X-GOD-CSRF": token, "Origin": base})
+        submitted = json.loads(urllib.request.urlopen(request).read())
+        assert submitted["kind"] == "AUTONOMOUS_GOAL"
+        for _ in range(30):
+            status = json.loads(urllib.request.urlopen(
+                base + "/api/status?job_id=" + submitted["job_id"]).read())
+            if status["job"]["state"] == "COMPLETE": break
+            time.sleep(.02)
+        assert status["job"]["result"] == "durable-explicit-goal"
+        assert status["goal"]["id"] == "durable-explicit-goal"
+        assert status["goal"]["description"] == text
     finally:
         server.shutdown(); thread.join(5)

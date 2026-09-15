@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from typing import Any, Callable, Protocol
-from .data_policy import DataClass, DisclosureApproval, OutboundDataPolicy
+from .data_policy import DataClass, OutboundDataPolicy
 
 
 class ProviderUnavailable(RuntimeError):
@@ -65,7 +65,9 @@ class ModelBus:
         if remote and not classes:
             raise PermissionError("remote inference requires outbound data classification")
         self.outbound_policy.validate(classes, remote=remote,
-            artifact_id=request.pop("artifact_id", None), approval=request.pop("disclosure_approval", None))
+            artifact_id=request.pop("artifact_id", None), content_hash=request.pop("content_hash", None),
+            provider=provider, purpose=request.pop("outbound_purpose", None),
+            approval=request.pop("disclosure_approval", None))
         return organ.infer(request)
 
 

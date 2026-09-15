@@ -33,6 +33,12 @@ text, public evidence, and compact operational metadata automatically; constitut
 sister data is never exportable and workspace-private disclosure requires an artifact-specific
 owner approval.
 
+Workspace disclosure approval reuses the Root-signed `OwnerCapabilityAuthority`; it is bound to
+the exact artifact, content hash, provider, purpose, expiry, zero cost, and outbound-policy
+executor, and is consumed once. A constructed value, altered scope, expiry, or replay cannot
+authorize transmission. Constitutional credential, Root, and private-sister classes remain
+non-exportable regardless of ordinary disclosure approval.
+
 ### Durable autonomous goal engine
 
 The production runtime exposes one-step `advance_goal(goal_id)` and bounded
@@ -44,6 +50,20 @@ already recorded action fingerprint after restart. Uncertainty, risk, stagnation
 outcomes, and ambiguous completion trigger metacognition and independent twin recruitment.
 Only an owner/evaluator-verified downstream outcome can complete a goal or update trusted
 competence; provider or transport success alone cannot.
+
+One durable action ledger spans initial goal submission and every later advance. Canonical
+semantic fingerprints transition through proposed, approval, execution, observation,
+verification, failure, retryable, or superseded states. Same-step twin duplicates are recorded
+as `AGREE` and execute once without stagnation; distinct compatible proposals are
+`COMPLEMENTARY`; incompatible effects are `CONFLICT` and only the evidence/utility-arbitrated
+move proceeds. Historical repetition without changed evidence alone increases stagnation.
+
+Action-level outcome verification is separate from goal success. A completion request is only
+`CANDIDATE_FOR_COMPLETION`; final completion requires a Root-authorized, single-use goal-level
+verification bound to the stable success criteria and evidence references. The UI launches
+arbitrary owner text explicitly as chat or as an autonomous goal; phrase inference is not
+required. Gemini remains visibly blocked in Corporate Safe mode while its account-specific
+zero-cost and privacy eligibility cannot be demonstrated.
 
 ### Root and authority
 

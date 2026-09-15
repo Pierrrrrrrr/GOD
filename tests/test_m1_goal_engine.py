@@ -1,9 +1,13 @@
 from pathlib import Path
 import time
+import hashlib
+import json
+from dataclasses import asdict, replace
 
-from tmco.awakening import GodRuntime
+from tmco.awakening import GoalSuccessVerification, GodRuntime
 from tmco.embodiment import OutcomeEvaluation, OutcomeEvaluator
 from tmco.models import ModelRecord
+from tmco.capabilities import CapabilityRequest
 
 
 class GoalProvider:
@@ -61,9 +65,28 @@ def test_multistep_goal_restart_exact_continuity_and_true_completion(tmp_path: P
     evaluation = OutcomeEvaluation(action_id, OutcomeEvaluator.OWNER.value,
                                    ("owner-confirmed-artifact",), True, "accepted", time.time(), "meets goal")
     assert restored.evaluate_outcome(evaluation)
-    completed = restored.advance_goal(goal_id)
-    assert completed["status"] == "completed"
+    candidate = restored.advance_goal(goal_id)
+    assert candidate["status"] != "completed"
+    goal_check = GoalSuccessVerification(goal_id, "OWNER", ("credible evidence of progress",),
+        ("owner-goal-verification",), True, time.time(), "the complete objective is satisfied")
+    digest = hashlib.sha256(json.dumps(asdict(goal_check), sort_keys=True,
+                            separators=(",", ":")).encode()).hexdigest()
+    request = CapabilityRequest(restored.organism.root.owner, "goal-verification", "OWNER",
+        "verify stable owner goal", digest, "goal-success-gate", "goal-verification", goal_id,
+        allowed_submitted_data=goal_check.evidence_refs, maximum_cost=0)
+    request_id = restored.owner_capabilities.request(request)
+    capability = restored.owner_capabilities.decide(
+        restored.owner_capabilities.owner_control().decide(request_id, True))
+    assert capability is not None
+    import pytest
+    with pytest.raises(PermissionError):
+        restored.verify_goal_success(replace(goal_check, reason="altered"), capability)
+    assert restored.verify_goal_success(goal_check, capability)
     restored.close()
+    final_runtime = make_runtime(tmp_path, GoalProvider())
+    completed = final_runtime.advance_goal(goal_id)
+    assert completed["status"] == "completed"
+    final_runtime.close()
 
 
 def test_goal_max_steps_is_a_hard_bound(tmp_path: Path) -> None:
@@ -128,9 +151,80 @@ def test_equivalent_actions_escalate_then_block_honestly(tmp_path: Path) -> None
     goal_id = runtime.submit_goal("Test repeated strategy", important=False)["goal_id"]
     runtime.advance_goal(goal_id)
     runtime.advance_goal(goal_id)
+    runtime.advance_goal(goal_id)
+    runtime.advance_goal(goal_id)
     blocked = runtime.advance_goal(goal_id)
     assert blocked["status"] == "blocked" and blocked["blocker"] == "STRATEGY"
     assert blocked["current_step"] == "BLOCKED"
     assert len([o for o in runtime.embodiment_store.all("observation")
                 if o.get("goal_id") == goal_id and o.get("operation") == "write"]) == 1
+    runtime.close()
+
+
+def test_initial_action_ledger_prevents_restart_reexecution(tmp_path: Path) -> None:
+    class InitialRepeating(GoalProvider):
+        demand = {"required_capability": "filesystem", "intent": "write",
+            "inputs": {"path": "initial-once.txt", "content": "once"}, "expected_output": "artifact",
+            "expected_evidence": "hash", "risk": 0, "side_effect_class": "workspace", "budget": 0,
+            "reversibility": True, "confidence": .8, "goal_value": 1, "information_gain": .5,
+            "capability_gain": 0, "uncertainty": .2, "network_need": "none", "filesystem_need": "workspace"}
+        def infer(self, request):
+            result = super().infer(request)
+            if "compact GoalBrief" not in request["prompt"]:
+                result["body_demands"] = [self.demand]
+            elif isinstance(result, dict):
+                result["body_demands"] = [self.demand]
+            return result
+    provider = InitialRepeating(); runtime = make_runtime(tmp_path, provider)
+    goal_id = runtime.submit_goal("Write one initial durable artifact", important=False)["goal_id"]
+    writes = [o for o in runtime.embodiment_store.all("observation") if o.get("operation") == "write"]
+    assert len(writes) == 1
+    runtime.close()
+    restored = make_runtime(tmp_path, InitialRepeating())
+    state = restored.advance_goal(goal_id)
+    writes = [o for o in restored.embodiment_store.all("observation") if o.get("operation") == "write"]
+    assert len(writes) == 1
+    assert next(iter(state["action_ledger"].values()))["status"] == "VERIFIED"
+    restored.close()
+
+
+def test_twin_agree_complementary_and_conflict_semantics(tmp_path: Path) -> None:
+    from tmco.embodiment import CapabilityDemand
+    runtime = make_runtime(tmp_path, GoalProvider())
+    views = {"Saphira-A": {}, "Saphira-B": {}}
+    def candidate(intent, value=1, risk=0, reversible=True):
+        demand = CapabilityDemand("g", "t", "filesystem", intent, {"path": intent}, "out",
+                                  risk=risk, side_effects="workspace", reversible=reversible)
+        return (value, demand, {})
+    same = candidate("write")
+    relation, selected = runtime._twin_decision([same, same], views)
+    assert relation == "AGREE" and len(selected) == 1
+    relation, selected = runtime._twin_decision([candidate("write"), candidate("hash")], views)
+    assert relation == "COMPLEMENTARY" and len(selected) == 2
+    relation, selected = runtime._twin_decision([candidate("write", risk=.8), candidate("delete", risk=.9)], views)
+    assert relation == "CONFLICT" and len(selected) == 1
+    runtime.close()
+
+
+def test_same_step_twin_duplicate_is_consensus_not_stagnation(tmp_path: Path) -> None:
+    class Consensus(GoalProvider):
+        def infer(self, request):
+            if "compact GoalBrief" not in request["prompt"]:
+                return super().infer(request)
+            return {"next_useful_action": "agree", "completion_requested": False,
+                "uncertainty": 0, "risk": 0, "blocker": None,
+                "body_demands": [{"required_capability": "filesystem", "intent": "write",
+                  "inputs": {"path": "consensus.txt", "content": "one"}, "expected_output": "artifact",
+                  "expected_evidence": "hash", "risk": 0, "side_effect_class": "workspace", "budget": 0,
+                  "reversibility": True, "confidence": .8, "goal_value": 1, "information_gain": .5,
+                  "capability_gain": 0, "uncertainty": 0, "network_need": "none", "filesystem_need": "workspace"}]}
+    runtime = make_runtime(tmp_path, Consensus())
+    goal_id = runtime.submit_goal("Test twin consensus", important=False)["goal_id"]
+    import json
+    state = json.loads(runtime.store.rows("SELECT state FROM goals WHERE id=?", (goal_id,))[0]["state"])
+    state["escalate_twin"] = True; runtime.store.put("goals", goal_id, state)
+    advanced = runtime.advance_goal(goal_id)
+    assert advanced["twin_decision"] == "AGREE"
+    assert advanced["stagnation_count"] == 0
+    assert len([o for o in runtime.embodiment_store.all("observation") if o.get("operation") == "write"]) == 1
     runtime.close()
