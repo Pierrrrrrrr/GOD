@@ -248,7 +248,7 @@ class GodRuntime:
 
     def _develop_gap(self, demand: CapabilityDemand, interpretations: dict[str, dict[str, Any]]) -> DevelopmentCandidate | None:
         if (demand.network_need != "none" or demand.filesystem_need not in {"workspace", "none"}
-                or set(interpretations) != {"Saphira-A", "Saphira-B"}):
+                or not interpretations):
             return None
         catalog = self._composable_catalog()
         contract = {"id": "composite:<name>", "capability": demand.required_capability,
@@ -257,8 +257,16 @@ class GodRuntime:
                                "arguments": {"argument": "input.<name> or steps.<prior-step>.<field>"}}],
                     "description": "compact purpose", "version": "1"}
         proposals: dict[str, Any] = {}
+        development_records: dict[str, ModelRecord] = {}
+        used = {view["model"] for view in interpretations.values()}
         for lineage in ("Saphira-A", "Saphira-B"):
-            record = self.records[interpretations[lineage]["model"]]
+            if lineage in interpretations:
+                record = self.records[interpretations[lineage]["model"]]
+            else:
+                record = self.router.choose(list(self.records.values()), "capability_development",
+                                            exclude=used, policy=self.routing_policy)
+                used.add(record.key)
+            development_records[lineage] = record
             def propose(_demand: CapabilityDemand, *, lineage=lineage, record=record):
                 response = self._model_call(record, demand.goal_id, None, "capability_development", lineage,
                     "Independently propose one declarative CompositeOrganSpec. Return only a JSON object under "
@@ -274,7 +282,7 @@ class GodRuntime:
             proposals[lineage] = propose
 
         def audit(auditor: str, origin: str, spec: Any, evidence: dict[str, Any]) -> bool:
-            record = self.records[interpretations[auditor]["model"]]
+            record = development_records[auditor]
             response = self._model_call(record, demand.goal_id, None, "capability_development_audit", auditor,
                 "Audit this tested declarative candidate using only its compact spec and objective evidence. "
                 "Return approved as a JSON boolean. Do not return private reasoning.",

@@ -134,6 +134,17 @@ class DevelopmentEngine:
             credential_handles=tuple(sorted({handle for part in parts for handle in part.credential_handles})),
             trusted=True)
 
+    @staticmethod
+    def validate_need(spec: CompositeOrganSpec, demand: CapabilityDemand) -> None:
+        """Ensure a proposal answers exactly the gap that triggered development."""
+        if spec.capability != demand.required_capability:
+            raise CompositeRejected("candidate capability does not match development need")
+        if spec.operation != demand.intent:
+            raise CompositeRejected("candidate operation does not match development need")
+        unavailable = set(spec.required_inputs) - set(demand.inputs)
+        if unavailable:
+            raise CompositeRejected(f"candidate widens required inputs: {sorted(unavailable)}")
+
     def _execute(self, spec: CompositeOrganSpec, inputs: dict[str, Any]) -> dict[str, Any]:
         missing = set(spec.required_inputs) - set(inputs)
         if missing: raise CompositeRejected(f"missing composite inputs: {sorted(missing)}")
@@ -209,6 +220,7 @@ class DevelopmentEngine:
                 self.store.put("development_candidate", candidate.id, candidate)
                 self._record("CANDIDATE_PROPOSED", candidate.id + ":proposed",
                              {"candidate_id": candidate.id, "origin": lineage, "spec_id": candidate.spec.id})
+                self.validate_need(candidate.spec, demand)
                 self.validate(candidate.spec)
                 evidence = self._test_isolated(candidate.spec, demand.inputs)
                 evaluation = evaluator(candidate.spec, evidence)

@@ -1,4 +1,5 @@
 import json
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -90,6 +91,28 @@ def test_failed_test_or_audit_never_mutates_registry(tmp_path: Path) -> None:
     assert not (tmp_path / "workspace/proof.txt").exists()
     assert engine.develop(demand(), proposals, lambda _s, _e: True, lambda *_: False) is None
     assert not any(key.startswith("composite:") for key in bus.manifests)
+    store.close()
+
+
+@pytest.mark.parametrize("mismatch, reason", [
+    (replace(valid_spec(), capability="different-capability"), "capability"),
+    (replace(valid_spec(), operation="different-operation"), "operation"),
+    (replace(valid_spec(), required_inputs=("path", "content", "unavailable")), "widens required inputs"),
+])
+def test_candidate_must_match_development_need_before_testing(
+        tmp_path: Path, mismatch: CompositeOrganSpec, reason: str) -> None:
+    bus, store, _, engine = fixture_engine(tmp_path)
+    proposals = {"Saphira-A": lambda _demand: mismatch,
+                 "Saphira-B": lambda _demand: replace(mismatch, id=mismatch.id + "-b")}
+    assert engine.develop(demand(), proposals, lambda *_: pytest.fail("mismatch was tested"),
+                          lambda *_: pytest.fail("mismatch was audited")) is None
+    events = store.all("development_event")
+    assert len([event for event in events if event["kind"] == "CANDIDATE_REJECTED"]) == 2
+    assert not any(event["kind"] == "CANDIDATE_TESTED" for event in events)
+    assert reason in next(event["reason"] for event in events if event["kind"] == "CANDIDATE_REJECTED")
+    assert not store.all("composite_spec")
+    assert not any(identity.startswith("composite:") for identity in bus.manifests)
+    assert not (tmp_path / "workspace/proof.txt").exists()
     store.close()
 
 
@@ -192,11 +215,13 @@ class LiveDevelopmentProvider:
         raise AssertionError(f"unexpected model prompt: {prompt[:80]}")
 
 
-def test_normal_goal_develops_ranks_resumes_and_restores(tmp_path: Path) -> None:
+def test_focused_goal_recruits_twin_development_ranks_resumes_and_restores(tmp_path: Path) -> None:
     provider = LiveDevelopmentProvider(tmp_path / "workspace")
     runtime = GodRuntime(tmp_path, {"models": provider},
         [ModelRecord("models", "A"), ModelRecord("models", "B")], secret="live-development-test")
-    episode = runtime.submit_goal("Audit a verified artifact through developmental composition")
+    episode = runtime.submit_goal("Create a verified artifact through developmental composition")
+    assert episode["work_class"] == "FOCUSED"
+    assert len([call for call in provider.calls if "Reason independently" in call["prompt"]]) == 1
     proposed = runtime.embodiment_store.all("development_candidate")
     assert {item["origin"] for item in proposed} == {"Saphira-A", "Saphira-B"}
     # B was proposed second but wins because a real digest scores above existence evidence.
