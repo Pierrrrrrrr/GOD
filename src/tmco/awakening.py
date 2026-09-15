@@ -18,7 +18,7 @@ from .embodiment import (ActionLoop, CapabilityDemand, CapabilityResolver, Embod
                          WorkspaceFilesystemOrgan)
 from .executive import Cognition
 from .development import DevelopmentCandidate, DevelopmentEngine
-from .models import ModelRecord, ModelRouter
+from .models import ModelRecord, ModelRouter, ResponseMode
 from .morphogenesis import AssemblyFormationPolicy
 from .system import TMCOSystem
 from .types import ActionCandidate, ComputeBudget, Goal, GoalStatus
@@ -110,9 +110,23 @@ class ModelBackedCognition(Cognition):
         result = self.bus.request(self.record.provider, {
             "model_id": self.record.model_id,
             "prompt": demand + "\nJSON context:\n" + json.dumps(context),
+            "response_mode": ResponseMode.STRUCTURED.value,
         })
         if not isinstance(result, dict):
             raise ValueError("model cognition must return a JSON object")
+        return result
+
+    def converse(self, message: str, context: dict[str, Any]) -> str:
+        """Send owner-authored text plus compact, non-private operational context."""
+        result = self.bus.request(self.record.provider, {
+            "model_id": self.record.model_id,
+            "prompt": "Reply naturally and truthfully. Do not invent activity.\n"
+                      + "Owner message:\n" + message + "\nOperational context:\n"
+                      + json.dumps(context),
+            "response_mode": ResponseMode.TEXT.value,
+        })
+        if not isinstance(result, str):
+            raise ValueError("conversation model must return text")
         return result
 
     def decompose(self, goal: Goal) -> list[str]:
@@ -352,10 +366,10 @@ class GodRuntime:
                      "routing_reason": self.router.reason(record, task, self.routing_policy),
                      "started_at": started_wall, "finished_at": None, "latency_ms": None,
                      "success": None}
-        self.store.model_selection(selection)
         self._event("MODEL_SELECTED", f"{record.key} selected for {task}",
                     {key: selection[key] for key in ("id", "goal_id", "episode_id", "task_class", "colony",
                                                      "provider", "model_id", "routing_policy", "routing_reason")})
+        self.store.model_selection(selection)
         try:
             result = ModelBackedCognition(self.bus, record).ask(demand, context); success = True
             return result
@@ -365,6 +379,33 @@ class GodRuntime:
             latency = (time.monotonic() - started) * 1000
             selection.update(finished_at=time.time(), latency_ms=latency, success=int(success))
             self.store.model_selection(selection); self.router.observe_call(record, success, latency)
+
+    def _conversation_call(self, message: str, state: dict[str, Any] | None) -> str:
+        """Use TEXT mode with bounded failover and no private or workspace state."""
+        attempted: set[str] = set()
+        last_error: Exception | None = None
+        while len(attempted) < len(self.records):
+            try:
+                record = self.router.choose(list(self.records.values()), "conversation",
+                                            exclude=attempted, policy=self.routing_policy)
+            except RuntimeError:
+                break
+            attempted.add(record.key)
+            started = time.monotonic()
+            try:
+                compact = {key: state.get(key) for key in
+                           ("status", "current_step", "work_class") if state is not None}
+                answer = ModelBackedCognition(self.bus, record).converse(message, compact)
+                self.router.observe_call(record, True, (time.monotonic() - started) * 1000)
+                self._event("MODEL_RESPONSE", f"{record.key} returned conversation text")
+                self._save_models()
+                return answer
+            except Exception as error:
+                last_error = error
+                self.router.observe_call(record, False, (time.monotonic() - started) * 1000)
+                self._event("MODEL_FAILOVER", f"{record.key} failed; trying another available model")
+        self._save_models()
+        raise ProviderUnavailable("all configured conversation models are unavailable") from last_error
 
     def _sister_transition(self, colony: str, goal_id: str | None, status: str, summary: str) -> None:
         confidence = round(sum(n.confidence for n in self.organism.colonies[colony].neurons.values()) /
@@ -806,14 +847,8 @@ class GodRuntime:
         else:
             if not self.intelligence_connected:
                 raise ProviderUnavailable("external intelligence is disconnected")
-            record = self.router.choose(list(self.records.values()), "conversation",
-                                        policy=self.routing_policy)
             persisted = json.loads(active[0]["state"]) if active else None
-            result = self._model_call(record, persisted.get("id") if persisted else None,
-                persisted.get("episode_id") if persisted else None, "conversation", None,
-                "Reply naturally and truthfully. Do not invent activity; use only supplied persisted state.",
-                {"message": message, "active_goal": persisted})
-            answer = str(result.get("answer", result.get("response", "I do not have an answer.")))
+            answer = self._conversation_call(message, persisted)
         self.store.chat("assistant", answer)
         return answer
 

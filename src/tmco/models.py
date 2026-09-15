@@ -5,7 +5,15 @@ import json
 import time
 import urllib.request
 from dataclasses import dataclass, field
+from enum import Enum
 from typing import Any
+
+
+class ResponseMode(str, Enum):
+    """Explicit trust contract for a model response."""
+
+    TEXT = "text"
+    STRUCTURED = "structured"
 
 
 @dataclass(slots=True)
@@ -38,19 +46,25 @@ class HTTPModelProvider:
     def __init__(self, endpoint: str, api_key: str, *, gemini: bool = False):
         self.endpoint, self.api_key, self.gemini = endpoint.rstrip("/"), api_key, gemini
 
-    def infer(self, request: dict[str, Any]) -> dict[str, Any]:
+    def infer(self, request: dict[str, Any]) -> dict[str, Any] | str:
         prompt = request.get("prompt", "")
+        try:
+            mode = ResponseMode(request.get("response_mode", ResponseMode.STRUCTURED.value))
+        except ValueError:
+            raise ValueError("unknown model response mode") from None
         model_id = request.get("model_id")
         if not isinstance(model_id, str) or not model_id:
             raise ValueError("model_id is required for every model request")
         if self.gemini:
-            body = {"contents": [{"parts": [{"text": prompt}]}],
-                    "generationConfig": {"responseMimeType": "application/json"}}
+            body = {"contents": [{"parts": [{"text": prompt}]}]}
+            if mode is ResponseMode.STRUCTURED:
+                body["generationConfig"] = {"responseMimeType": "application/json"}
             headers = {"Content-Type": "application/json", "x-goog-api-key": self.api_key}
             endpoint = f"{self.endpoint}/models/{model_id}:generateContent"
         else:
-            body = {"model": model_id, "messages": [{"role": "user", "content": prompt}],
-                    "response_format": {"type": "json_object"}}
+            body = {"model": model_id, "messages": [{"role": "user", "content": prompt}]}
+            if mode is ResponseMode.STRUCTURED:
+                body["response_format"] = {"type": "json_object"}
             headers = {"Content-Type": "application/json", "Authorization": f"Bearer {self.api_key}"}
             endpoint = self.endpoint
         call = urllib.request.Request(endpoint, json.dumps(body).encode(), headers=headers)
@@ -64,7 +78,21 @@ class HTTPModelProvider:
             content = payload["candidates"][0]["content"]["parts"][0]["text"]
         else:
             content = payload["choices"][0]["message"]["content"]
-        return json.loads(content) if isinstance(content, str) else content
+        if mode is ResponseMode.TEXT:
+            if not isinstance(content, str):
+                raise RuntimeError("model provider returned an invalid text response")
+            return content
+        if isinstance(content, dict):
+            return content
+        if not isinstance(content, str):
+            raise RuntimeError("model provider returned an invalid structured response")
+        try:
+            structured = json.loads(content)
+        except (TypeError, ValueError):
+            raise RuntimeError("model provider returned invalid structured data") from None
+        if not isinstance(structured, dict):
+            raise RuntimeError("structured model response must be an object")
+        return structured
 
     def catalog(self) -> list[dict[str, Any]]:
         if self.gemini:

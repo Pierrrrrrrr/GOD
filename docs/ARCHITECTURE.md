@@ -4,6 +4,20 @@ G.O.D. is one governed system containing two permanently distinct cognitive and 
 
 ## Live Core
 
+### Corporate-safe product boundary
+
+`CORPORATE_SAFE` is the permanent default web posture. The dependency-free UI binds only to
+IPv4 loopback, validates the HTTP host and same-origin mutation context, and requires a
+cryptographically random, process-memory-only mutation capability. Sensitive responses are
+non-cacheable and carry a restrictive local-only content policy. Request, chat, form-field,
+and queued-work bounds fail closed without returning provider details or exception text.
+
+Remote inference has two explicit response contracts. Ordinary owner conversation uses
+`TEXT`; cognitive decisions use validated `STRUCTURED` objects. Remote prompts are limited to
+owner-authored text and compact operational/public context. Credentials, Root state, sister
+private state, raw reasoning, and workspace file contents are not model context. Local Ollama
+is discovered only when already installed and populated; the runtime never installs it.
+
 ### Root and authority
 
 `RootKernel` is the signed authorization boundary and remains outside cognition and evolution. `RootSecretStore` separates its secret from checkpoint/event state (mode-0600 on POSIX and a DPAPI current-user protected blob on Windows); persisted state contains only its fingerprint/reference. `RootGuard` exposes bounded signing and verification. The HMAC-chained audit detects mutation, and restored permissions derive from signed grants rather than checkpoint claims.

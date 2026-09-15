@@ -16,6 +16,10 @@ This roadmap advances G.O.D. by evidence/competence gates, not calendar phases o
 
 ## M1 — Durable Autonomous Goal Loop
 
+**Prerequisite product gate:** the loopback-only `CORPORATE_SAFE` UI, explicit text/structured
+model contracts, local-model discovery, bounded conversation failover, and honest unavailable
+states must remain operational. These recovery mechanisms do not by themselves satisfy M1.
+
 A goal survives interruption and continues through:
 
 > understand → choose the next useful action or experiment → act → observe → verify → update → continue/replan → completion, honest block, or owner decision

@@ -9,7 +9,7 @@ class ProviderUnavailable(RuntimeError):
 
 
 class ModelProvider(Protocol):
-    def infer(self, request: dict[str, Any]) -> dict[str, Any]: ...
+    def infer(self, request: dict[str, Any]) -> dict[str, Any] | str: ...
 
 
 class TestProvider:
@@ -53,7 +53,7 @@ class ModelBus:
             raise ProviderUnavailable("test-only model providers are rejected by the production bus")
         self.providers[name] = provider
 
-    def request(self, provider: str, request: dict[str, Any]) -> dict[str, Any]:
+    def request(self, provider: str, request: dict[str, Any]) -> dict[str, Any] | str:
         if provider not in self.providers:
             raise ProviderUnavailable(f"model provider {provider!r} is not configured")
         return self.providers[provider].infer(request)

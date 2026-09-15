@@ -5,7 +5,7 @@ import json
 import urllib.request
 from typing import Any, Protocol
 
-from .models import HTTPModelProvider, ModelRecord
+from .models import HTTPModelProvider, ModelRecord, ResponseMode
 
 
 class ProviderConnector(Protocol):
@@ -13,7 +13,7 @@ class ProviderConnector(Protocol):
 
     def probe(self, model_id: str) -> None: ...
     def discover(self) -> list[ModelRecord]: ...
-    def infer(self, request: dict[str, Any]) -> dict[str, Any]: ...
+    def infer(self, request: dict[str, Any]) -> dict[str, Any] | str: ...
 
 
 def _price(value: object) -> float | None:
@@ -31,7 +31,7 @@ class CatalogConnector:
     def __init__(self, transport: HTTPModelProvider):
         self.transport = transport
 
-    def infer(self, request: dict[str, Any]) -> dict[str, Any]:
+    def infer(self, request: dict[str, Any]) -> dict[str, Any] | str:
         return self.transport.infer(request)
 
     def probe(self, model_id: str) -> None:
@@ -127,8 +127,15 @@ class OllamaConnector:
         if not any(record.model_id == model_id for record in self.discover()):
             raise RuntimeError("local model is unavailable")
 
-    def infer(self, request: dict[str, Any]) -> dict[str, Any]:
+    def infer(self, request: dict[str, Any]) -> dict[str, Any] | str:
+        mode = ResponseMode(request.get("response_mode", ResponseMode.STRUCTURED.value))
         payload = self._json("/api/chat", {"model": request["model_id"], "stream": False,
-                                           "format": "json", "messages": [
+                                           **({"format": "json"} if mode is ResponseMode.STRUCTURED else {}), "messages": [
                                                {"role": "user", "content": request["prompt"]}]})
-        return json.loads(payload["message"]["content"])
+        content = payload["message"]["content"]
+        if mode is ResponseMode.TEXT:
+            return str(content)
+        value = json.loads(content)
+        if not isinstance(value, dict):
+            raise RuntimeError("structured model response must be an object")
+        return value

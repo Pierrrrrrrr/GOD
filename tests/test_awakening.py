@@ -27,8 +27,8 @@ class ScriptedOrgan:
             return {"disagreements": ["sequence versus experiment"],
                     "synthesis": "Run a bounded experiment, then sequence evidence.",
                     "selected_next_action": "run bounded experiment", "rationale": "It tests both claims."}
-        if "Reply naturally" in prompt:
-            return {"answer": "Hello Pier. I am ready, and I have not invented any active work."}
+        if request.get("response_mode") == "text":
+            return "Hello Pier. I am ready, and I have not invented any active work."
         action = "map dependencies" if self.perspective == "A" else "run an experiment"
         return {"desired_outcome": "a realistic result", "success_evidence": ["measured result"],
                 "constraints": ["bounded resources"], "unknowns": ["causal mechanism"],
@@ -177,7 +177,7 @@ class ProbeProvider:
     def infer(self, request: dict) -> dict:
         if not self.valid: raise RuntimeError("safe failure")
         if "Capability probe" in request["prompt"]: return {"probe": True}
-        return {"answer": "persist me"}
+        return "persist me" if request.get("response_mode") == "text" else {"answer": "persist me"}
 
     def catalog(self) -> list[dict]:
         return [{"id": "chosen", "context_length": 8192,
@@ -193,7 +193,7 @@ def test_connection_probe_metadata_and_visible_chat_restart(tmp_path: Path,
     ProbeProvider.valid = False
     failed = App(tmp_path)
     identities = {name: colony.id for name, colony in failed.runtime.organism.colonies.items()}
-    assert "Saphira-A ONLINE" in failed.status() and "Root SECURE" in failed.status()
+    assert "Saphira-A INITIALIZED" in failed.status() and "Root AUDIT VERIFIED" in failed.status()
     assert "Intelligence DISCONNECTED" in failed.status()
     assert failed.runtime.organism.memory is not None
     with pytest.raises(ProviderUnavailable, match="disconnected"):
@@ -217,7 +217,7 @@ def test_connection_probe_metadata_and_visible_chat_restart(tmp_path: Path,
     ProbeProvider.valid = False
     restored = App(tmp_path)
     assert {name: colony.id for name, colony in restored.runtime.organism.colonies.items()} == identities
-    assert "Saphira-A ONLINE" in restored.status() and "Root SECURE" in restored.status()
+    assert "Saphira-A INITIALIZED" in restored.status() and "Root AUDIT VERIFIED" in restored.status()
     assert "Intelligence DISCONNECTED" in restored.status()
     assert "Pier: hello" in restored.transcript and "G.O.D.: persist me" in restored.transcript
     with pytest.raises(ProviderUnavailable, match="disconnected"):
@@ -268,7 +268,7 @@ def test_local_server_get_keeps_sqlite_on_server_thread_and_closes(tmp_path: Pat
                 f"http://127.0.0.1:{server.server_address[1]}/", timeout=5) as response:
             page = response.read().decode()
         assert response.status == 200
-        assert "Saphira-A ONLINE" in page
+        assert "Saphira-A INITIALIZED" in page
         assert "Intelligence DISCONNECTED" in page
     finally:
         server.shutdown()
