@@ -44,7 +44,7 @@ def test_real_godruntime_research_save_sister_digest_and_restart(tmp_path: Path)
         def log_message(self, *_): pass
     server=HTTPServer(("127.0.0.1",0),Evidence); worker=threading.Thread(target=server.serve_forever); worker.start()
     url=f"http://127.0.0.1:{server.server_port}/status"; providers={"p":BodyPlanningProvider(url)}
-    runtime=GodRuntime(tmp_path,providers,[ModelRecord("p","A"),ModelRecord("p","B")],secret="key",web_test_allow_hosts={"127.0.0.1"})
+    runtime=GodRuntime(tmp_path,providers,[ModelRecord("p", "A", input_cost=0, output_cost=0),ModelRecord("p", "B", input_cost=0, output_cost=0)],secret="key",web_test_allow_hosts={"127.0.0.1"})
     identities={k:v.id for k,v in runtime.organism.colonies.items()}; lineages={k:list(v.lineage) for k,v in runtime.organism.colonies.items()}
     try:
         episode=runtime.submit_goal("Research current protocol evidence and save a report")
@@ -92,7 +92,7 @@ def test_real_godruntime_research_save_sister_digest_and_restart(tmp_path: Path)
         assert {name:list(colony.memories) for name,colony in runtime.organism.colonies.items()}==memories
         assert "cognitive outcome remains unverified" in episode["body"]["final_response"]
     finally: runtime.close(); server.shutdown(); worker.join(); server.server_close()
-    restored=GodRuntime(tmp_path,providers,[ModelRecord("p","A"),ModelRecord("p","B")],secret="key",web_test_allow_hosts={"127.0.0.1"})
+    restored=GodRuntime(tmp_path,providers,[ModelRecord("p", "A", input_cost=0, output_cost=0),ModelRecord("p", "B", input_cost=0, output_cost=0)],secret="key",web_test_allow_hosts={"127.0.0.1"})
     assert {k:v.id for k,v in restored.organism.colonies.items()}==identities
     assert {k:list(v.lineage) for k,v in restored.organism.colonies.items()}==lineages
     assert restored.operational_status()["work_class"]=="DELIBERATIVE"
@@ -103,7 +103,7 @@ def test_real_godruntime_research_save_sister_digest_and_restart(tmp_path: Path)
 
 def test_real_godruntime_workspace_summarize_and_save(tmp_path: Path):
     provider=BodyPlanningProvider("unused")
-    runtime=GodRuntime(tmp_path,{"p":provider},[ModelRecord("p","A"),ModelRecord("p","B")],secret="key")
+    runtime=GodRuntime(tmp_path,{"p":provider},[ModelRecord("p", "A", input_cost=0, output_cost=0),ModelRecord("p", "B", input_cost=0, output_cost=0)],secret="key")
     workspace=tmp_path/"workspace"; workspace.mkdir(exist_ok=True); (workspace/"source.txt").write_text("alpha beta gamma")
     episode=runtime.submit_goal("Read this workspace file, summarize it, and save the summary beside it")
     assert episode["body"]["status"]=="executed"
@@ -126,7 +126,7 @@ def test_redirect_target_is_revalidated():
 
 
 def test_approval_resumes_exact_demand_and_deny_never_fakes_action(tmp_path: Path):
-    provider=BodyPlanningProvider("unused"); runtime=GodRuntime(tmp_path,{"p":provider},[ModelRecord("p","A"),ModelRecord("p","B")],secret="key")
+    provider=BodyPlanningProvider("unused"); runtime=GodRuntime(tmp_path,{"p":provider},[ModelRecord("p", "A", input_cost=0, output_cost=0),ModelRecord("p", "B", input_cost=0, output_cost=0)],secret="key")
     effects=[]
     manifest=OrganManifest("controlled-mutator","openapi","1",{"mutate":{"required":["value"]}},
         permissions={"controlled.mutate"},risk=.5,side_effect_class="external-mutation",reversible=False,

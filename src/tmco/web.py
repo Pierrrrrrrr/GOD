@@ -31,7 +31,7 @@ PAGE = """<!doctype html><html><head><meta charset=utf-8><meta name=csrf-token c
 <section class=panel><h2>Owner conversation</h2><div id=chat>{chat}</div><form id=chat-form method=post action=/chat><input name=message autofocus placeholder="Find a realistic way to achieve X" required><button>Send</button></form><h3>Safe sister summaries</h3><div id=sisters>{sisters}</div></section>
 <aside class="panel timeline"><h2>Live activity</h2><div id=events>{timeline}</div></aside></div>
 <fieldset><legend>Intelligence controls</legend><form method=post action=/local><button>DETECT LOCAL MODELS</button></form>
-<form method=post action=/policy><label>Routing <select name=policy><option>AUTO</option><option value=FREE_FIRST>FREE FIRST</option><option value=LOCAL_FIRST>LOCAL FIRST</option></select></label><button>Apply</button></form>
+<form method=post action=/policy><label>Zero-cost routing <select name=policy><option>ZERO_COST</option><option value=LOCAL_FIRST>LOCAL FREE FIRST</option><option value=FREE_FIRST>ANY VERIFIED FREE</option></select></label><button>Apply</button></form>
 <details><summary>Advanced: secrets file and manual provider/model IDs</summary><form method=post action=/import><input name=path placeholder="secrets.json path" required><label><input type=checkbox name=delete value=yes>Delete source after secure import</label><button>IMPORT</button></form><form method=post action=/connect>
 <select name=provider><option>OpenRouter</option><option>Gemini</option></select>
 <input name=model placeholder="model id" required>
@@ -41,7 +41,7 @@ const esc=x=>String(x??'none').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>
 const csrf=document.querySelector('meta[name=csrf-token]').content;
 async function poll(){const r=await fetch('/api/status',{cache:'no-store'});if(!r.ok)return;const s=await r.json();
 document.querySelector('#events').innerHTML=s.timeline.slice().reverse().map(e=>`<div class=event><b>${esc(e.kind)}</b><br>${esc(e.summary)}</div>`).join('');
-document.querySelector('#task').innerHTML=['job: '+esc(s.job?.state),'goal: '+esc(s.goal?.description),'step: '+esc(s.goal?.current_step),'work class: '+esc(s.goal?.work_class),'selected colony: '+esc(s.goal?.selected_colony),'selected model: '+esc(s.selection&&s.selection.provider+':'+s.selection.model_id),'routing reason: '+esc(s.selection?.routing_reason),'organ: '+esc(s.goal?.current_organ),'verification: '+esc(s.verification),'pending approval: '+esc(s.pending_approval?.id),'capability gap: '+esc(s.capability_gap?.reason)].join('<br>');
+document.querySelector('#task').innerHTML=['job: '+esc(s.job?.state),'goal: '+esc(s.goal?.description),'step: '+esc(s.goal?.current_step),'work class: '+esc(s.goal?.work_class),'selected colony: '+esc(s.goal?.selected_colony),'selected model: '+esc(s.selection&&s.selection.provider+':'+s.selection.model_id),'intelligence resource: '+esc(s.selection?.cost_classification||'NO FREE INTELLIGENCE AVAILABLE'),'routing reason: '+esc(s.selection?.routing_reason),'organ: '+esc(s.goal?.current_organ),'verification: '+esc(s.verification),'pending approval: '+esc(s.pending_approval?.id),'capability gap: '+esc(s.capability_gap?.reason)].join('<br>');
 document.querySelector('#sisters').innerHTML=Object.entries(s.sisters).map(([n,v])=>`<div class=summary><b>${esc(n)}</b><br>${esc(v?.status)} · ${esc(v?.summary)} · confidence ${esc(v?.confidence)}</div>`).join('');
 document.querySelector('#approval-live').innerHTML=s.pending_approval?`<fieldset><legend>Pending approval</legend><p>${esc(s.pending_approval.reason)} · ${esc(s.pending_approval.organ)}.${esc(s.pending_approval.operation)}</p><button onclick="decideApproval('${esc(s.pending_approval.id)}',true)">APPROVE</button><button onclick="decideApproval('${esc(s.pending_approval.id)}',false)">DENY</button></fieldset>`:'';
 document.querySelector('#chat').textContent=s.conversation.map(x=>(x.role==='user'?'Pier: ':'G.O.D.: ')+x.content).join('\n');}
@@ -94,11 +94,14 @@ class App:
         records = connector.discover()
         if not records:
             return 0
-        preferred = next((r for r in records if r.model_id == "openrouter/free"), records[0])
+        eligible = [record for record in records if record.zero_cost_eligible]
+        self.discovered.update((record.key, record) for record in records)
+        if not eligible:
+            return 0
+        preferred = next((r for r in eligible if r.privacy == "local"), eligible[0])
         connector.probe(preferred.model_id)
         self.connectors[connector.name] = connector
         self.provider_states[connector.name] = "CONNECTED"
-        self.discovered.update((record.key, record) for record in records)
         return len(records)
 
     def _apply_connectors(self) -> None:
@@ -121,7 +124,11 @@ class App:
         records = connector.discover()
         if not records:
             raise RuntimeError("provider catalog is unavailable")
-        preferred = next((r for r in records if r.model_id == "openrouter/free"), records[0])
+        self.discovered.update((record.key, record) for record in records)
+        eligible = [record for record in records if record.zero_cost_eligible]
+        if not eligible:
+            raise RuntimeError("NO_FREE_INTELLIGENCE_AVAILABLE")
+        preferred = eligible[0]
         connector.probe(preferred.model_id)
         self.vault.set_provider("openrouter", api_key)
         self.connectors[connector.name] = connector
@@ -133,7 +140,10 @@ class App:
         connector = GeminiConnector(api_key)
         records = connector.discover()
         if not records: raise RuntimeError("provider catalog is unavailable")
-        connector.probe(records[0].model_id)
+        self.discovered.update((record.key, record) for record in records)
+        eligible = [record for record in records if record.zero_cost_eligible]
+        if not eligible: raise RuntimeError("NO_FREE_INTELLIGENCE_AVAILABLE")
+        connector.probe(eligible[0].model_id)
         self.vault.set_provider("gemini", api_key)
         self.connectors[connector.name] = connector
         self.provider_states["gemini"] = "CONNECTED"
@@ -164,12 +174,6 @@ class App:
             name = "openrouter"
         else:
             raise ValueError("unsupported provider in CORPORATE_SAFE mode")
-        started = time.monotonic()
-        probe = organ.infer({"model_id": model,
-                             "prompt": "Capability probe. Return only JSON: {\"probe\": true}"})
-        probe_latency = (time.monotonic() - started) * 1000
-        if probe.get("probe") is not True:
-            raise RuntimeError("provider capability probe failed")
         record = ModelRecord(name, model)
         catalog = organ.catalog()
         metadata = next((item for item in catalog if item.get("id", item.get("name", "")).endswith(model)), None)
@@ -180,6 +184,15 @@ class App:
             pricing = metadata.get("pricing", {})
             record.input_cost = self._price(pricing.get("prompt"))
             record.output_cost = self._price(pricing.get("completion"))
+        self.discovered[record.key] = record
+        if not record.zero_cost_eligible:
+            raise RuntimeError(record.cost_classification)
+        started = time.monotonic()
+        probe = organ.infer({"model_id": model,
+                             "prompt": "Capability probe. Return only JSON: {\"probe\": true}"})
+        probe_latency = (time.monotonic() - started) * 1000
+        if not isinstance(probe, dict) or probe.get("probe") is not True:
+            raise RuntimeError("provider capability probe failed")
         self.runtime.attach_intelligence({name: organ}, [record])
         attached = self.runtime.records[record.key]
         ModelRouter.observe_call(attached, True, probe_latency)
@@ -218,12 +231,16 @@ class App:
                      f"Intelligence {intelligence}"]
         lines.append(f"Discovered providers: {len(self.runtime.bus.providers)}; models: {len(self.runtime.records)}")
         lines.append(f"Routing: {self.runtime.routing_policy}")
+        lines.append("Monetary budget: 0")
         lines.extend(f"{name.title()} — {status}" for name, status in self.provider_states.items())
+        lines.extend(f"Resource {record.key} — {record.cost_classification}"
+                     for record in sorted(self.discovered.values(), key=lambda item: item.key))
         state = self.runtime.operational_status(); show = lambda value: "none" if value is None or value == [] else str(value)
         lines.extend((f"Current goal: {show(state['current_goal'])}", f"Current step: {state['current_step']}",
                       f"Work class: {show(state['work_class'])}", f"Current body organ: {show(state['current_organ'])}",
                       f"Selected colony: {show(state['selected_colony'])}",
                       f"Selected model: {show(state['selected_model'])}",
+                      f"Intelligence resource: {state['intelligence_resource']}",
                       f"Routing reason: {show(state['routing_reason'])}",
                       f"Prediction: {show(state['prediction'])}", f"Verification: {show(state['verification'])}",
                       f"Last observation: {show(state['last_observation'])}", f"Pending approval: {show(state['pending_approval'])}",
@@ -354,6 +371,13 @@ def read_safe_snapshot(data: Path, jobs: dict[str, dict[str, object]] | None = N
         selected = connection.execute("SELECT goal_id,episode_id,task_class,colony,provider,model_id,routing_policy,"
                                       "routing_reason,started_at,finished_at,latency_ms,success FROM model_selections "
                                       "ORDER BY started_at DESC LIMIT 1").fetchone()
+        selected_view = dict(selected) if selected else None
+        if selected_view:
+            key = f'{selected_view["provider"]}:{selected_view["model_id"]}'
+            model = connection.execute("SELECT state FROM models WHERE key=?", (key,)).fetchone()
+            if model:
+                record = ModelRecord(**json.loads(model[0]))
+                selected_view["cost_classification"] = record.cost_classification
         events = [dict(row) for row in connection.execute(
             "SELECT sequence,kind,summary,created FROM runtime_events ORDER BY sequence DESC LIMIT 50")]
         sisters = {}
@@ -382,7 +406,7 @@ def read_safe_snapshot(data: Path, jobs: dict[str, dict[str, object]] | None = N
                 verification = json.loads(observation[0]).get("verification_state") if observation else None
             finally: body_db.close()
         job_values = jobs or {}; selected_job = job_values.get(job_id) if job_id else (list(job_values.values())[-1] if job_values else None)
-        return {"timeline": events, "sisters": sisters, "selection": dict(selected) if selected else None,
+        return {"timeline": events, "sisters": sisters, "selection": selected_view,
                 "goal": goal, "verification": verification, "pending_approval": pending,
                 "capability_gap": gap, "conversation": conversation, "job": selected_job}
     finally: connection.close()
@@ -489,7 +513,7 @@ def serve(data: Path, port: int, *, open_browser: bool = True) -> None:
                     count = worker.call("detect_local_models")
                     response = f"Discovered {count} local models."
                 elif self.path == "/policy":
-                    worker.call("set_policy", fields.get("policy", "AUTO"))
+                    worker.call("set_policy", fields.get("policy", "ZERO_COST"))
                     response = f"Routing policy: {app.runtime.routing_policy}."
                 elif self.path in {"/approve", "/deny"}:
                     worker.call("decide_approval", fields["id"], self.path == "/approve")

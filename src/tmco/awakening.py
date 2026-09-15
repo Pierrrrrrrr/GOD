@@ -170,7 +170,8 @@ class GodRuntime:
         self.bus = ModelBus(production=True)
         self.router = ModelRouter()
         self.records: dict[str, ModelRecord] = {}
-        self.routing_policy = "AUTO"
+        self.routing_policy = "ZERO_COST"
+        self.monetary_budget = 0
         self.cognition: Cognition = DisconnectedCognition()
         # DigitalNeuron formation remains an opt-in legacy experiment. Live body
         # capability resolution and development do not depend on it.
@@ -179,7 +180,10 @@ class GodRuntime:
         self.organism = TMCOSystem(directory / "organism", self.cognition, secret=secret,
                                    formation_policy=self.policy)
         self.store = AwakeningStore(directory / "awakening.sqlite3")
-        self.routing_policy = self.store.setting("routing_policy", "AUTO")
+        self.routing_policy = self.store.setting("routing_policy", "ZERO_COST")
+        if self.routing_policy == "AUTO":
+            self.routing_policy = "ZERO_COST"
+            self.store.set_setting("routing_policy", self.routing_policy)
         self.body_bus = BodyBus()
         self.embodiment_store = EmbodimentStore(directory / "embodiment.sqlite3")
         self.organ_registry = OrganRegistry(self.body_bus, self.embodiment_store)
@@ -312,10 +316,11 @@ class GodRuntime:
 
     @property
     def intelligence_connected(self) -> bool:
-        return bool(self.bus.providers and self.records)
+        return bool(self.bus.providers and any(record.availability and record.zero_cost_eligible
+                                               for record in self.records.values()))
 
     def set_routing_policy(self, policy: str) -> None:
-        if policy not in {"AUTO", "FREE_FIRST", "LOCAL_FIRST"}:
+        if policy not in {"ZERO_COST", "FREE_FIRST", "LOCAL_FIRST"}:
             raise ValueError("unknown routing policy")
         self.routing_policy = policy
         self.store.set_setting("routing_policy", policy)
@@ -333,8 +338,15 @@ class GodRuntime:
         # unavailability must not prevent this newly confirmed connection.
         for key, record in configured.items():
             self.records[key].availability = record.availability
-        initial = self.router.choose(list(self.records.values()), "conversation",
-                                     policy=self.routing_policy)
+        try:
+            initial = self.router.choose(list(self.records.values()), "conversation",
+                                         policy=self.routing_policy)
+        except RuntimeError:
+            self.cognition = DisconnectedCognition()
+            self.organism.executive.cognition = self.cognition
+            self._save_models()
+            self._event("INTELLIGENCE", "NO_FREE_INTELLIGENCE_AVAILABLE")
+            return
         self.cognition = ModelBackedCognition(self.bus, initial)
         self.organism.executive.cognition = self.cognition
         self._save_models()
@@ -405,7 +417,7 @@ class GodRuntime:
                 self.router.observe_call(record, False, (time.monotonic() - started) * 1000)
                 self._event("MODEL_FAILOVER", f"{record.key} failed; trying another available model")
         self._save_models()
-        raise ProviderUnavailable("all configured conversation models are unavailable") from last_error
+        raise ProviderUnavailable("NO_FREE_INTELLIGENCE_AVAILABLE") from last_error
 
     def _sister_transition(self, colony: str, goal_id: str | None, status: str, summary: str) -> None:
         confidence = round(sum(n.confidence for n in self.organism.colonies[colony].neurons.values()) /
@@ -416,7 +428,7 @@ class GodRuntime:
         if not text.strip():
             raise ValueError("a natural-language goal is required")
         if not self.intelligence_connected:
-            raise ProviderUnavailable("external intelligence is disconnected")
+            raise ProviderUnavailable("NO_FREE_INTELLIGENCE_AVAILABLE")
         goal_id, episode_id = uuid4().hex, uuid4().hex
         self._event("GOAL_ACCEPTED", "Owner goal accepted", {"goal_id": goal_id})
         goal = Goal(goal_id, text, ("credible evidence of progress",))
@@ -783,10 +795,14 @@ class GodRuntime:
         last = observations[-1] if observations else None
         selected_rows = self.store.rows("SELECT * FROM model_selections ORDER BY started_at DESC LIMIT 1")
         selected = dict(selected_rows[0]) if selected_rows else None
+        selected_key = f'{selected["provider"]}:{selected["model_id"]}' if selected else None
+        selected_record = self.records.get(selected_key) if selected_key else None
+        resource_class = (selected_record.cost_classification if selected_record else
+                          "NO FREE INTELLIGENCE AVAILABLE")
         return {"current_goal": goal.get("description"), "work_class": goal.get("work_class"),
                 "current_step": goal.get("current_step","idle"), "current_organ": goal.get("current_organ"),
                 "selected_colony": goal.get("selected_colony") or (selected.get("colony") if selected else None),
-                "selected_model": f'{selected["provider"]}:{selected["model_id"]}' if selected else None,
+                "selected_model": selected_key, "intelligence_resource": resource_class,
                 "routing_reason": selected.get("routing_reason") if selected else None,
                 "prediction": predictions[-1] if predictions else None,
                 "observation": last, "verification": last.get("verification") if last else None,
@@ -846,7 +862,7 @@ class GodRuntime:
             answer = self._state_answer(lower, active)
         else:
             if not self.intelligence_connected:
-                raise ProviderUnavailable("external intelligence is disconnected")
+                raise ProviderUnavailable("NO_FREE_INTELLIGENCE_AVAILABLE")
             persisted = json.loads(active[0]["state"]) if active else None
             answer = self._conversation_call(message, persisted)
         self.store.chat("assistant", answer)

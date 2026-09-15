@@ -5,7 +5,7 @@ import json
 import urllib.request
 from typing import Any, Protocol
 
-from .models import HTTPModelProvider, ModelRecord, ResponseMode
+from .models import HTTPModelProvider, ModelRecord, ResponseMode, _bounded_json
 
 
 class ProviderConnector(Protocol):
@@ -50,10 +50,6 @@ class OpenRouterConnector(CatalogConnector):
     def discover(self) -> list[ModelRecord]:
         records = [self._normalize(item) for item in self.transport.catalog()]
         records = [record for record in records if record is not None]
-        # This gateway alias selects a currently available free model; it is not a
-        # hard-coded underlying model and remains useful if catalog pricing is sparse.
-        if not any(record.model_id == "openrouter/free" for record in records):
-            records.append(ModelRecord(self.name, "openrouter/free", input_cost=0, output_cost=0))
         return records
 
     def _normalize(self, item: dict[str, Any]) -> ModelRecord | None:
@@ -112,7 +108,7 @@ class OllamaConnector:
                                          data=json.dumps(body).encode() if body else None,
                                          headers={"Content-Type": "application/json"})
         with urllib.request.urlopen(request, timeout=2) as response:
-            return json.load(response)
+            return _bounded_json(response)
 
     def discover(self) -> list[ModelRecord]:
         try:

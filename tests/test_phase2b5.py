@@ -107,7 +107,7 @@ def test_observatory_uses_actual_persisted_model_and_colony_without_rerouting(tm
                                                                               monkeypatch) -> None:
     provider = ProvenanceProvider()
     app = App(tmp_path)
-    app.runtime.attach_intelligence({"actual": provider}, [ModelRecord("actual", "model-used")])
+    app.runtime.attach_intelligence({"actual": provider}, [ModelRecord("actual", "model-used", input_cost=0, output_cost=0)])
     episode = app.runtime.submit_goal("summarize this", important=False)
     expected_colony = next(iter(episode["interpretations"]))
     monkeypatch.setattr(app.runtime.router, "choose", lambda *a, **k: (_ for _ in ()).throw(AssertionError("render routed")))
@@ -123,7 +123,7 @@ def test_observatory_uses_actual_persisted_model_and_colony_without_rerouting(tm
 class SlowGateway:
     name = "openrouter"
     def __init__(self, key): self.key = key
-    def discover(self): return [ModelRecord("openrouter", "one"), ModelRecord("openrouter", "two")]
+    def discover(self): return [ModelRecord("openrouter", "one", input_cost=0, output_cost=0), ModelRecord("openrouter", "two", input_cost=0, output_cost=0)]
     def probe(self, model_id): return None
     def infer(self, request):
         time.sleep(.35)
@@ -229,7 +229,7 @@ class BootstrapConnector:
     def __init__(self, name, valid=True): self.name, self.valid = name, valid
     def discover(self):
         if not self.valid: raise RuntimeError("invalid credential body must stay private")
-        return [ModelRecord(self.name, f"{self.name}-one"), ModelRecord(self.name, f"{self.name}-two")]
+        return [ModelRecord(self.name, f"{self.name}-one", input_cost=0, output_cost=0), ModelRecord(self.name, f"{self.name}-two", input_cost=0, output_cost=0)]
     def probe(self, model_id): return None
     def infer(self, request): return {"answer": "connected"}
 

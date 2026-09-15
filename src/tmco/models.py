@@ -8,6 +8,18 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any
 
+MAX_MODEL_RESPONSE_BYTES = 2 * 1024 * 1024
+
+
+def _bounded_json(response: Any) -> dict[str, Any]:
+    raw = response.read(MAX_MODEL_RESPONSE_BYTES + 1)
+    if len(raw) > MAX_MODEL_RESPONSE_BYTES:
+        raise RuntimeError("model provider response exceeded the safe limit")
+    value = json.loads(raw)
+    if not isinstance(value, dict):
+        raise RuntimeError("model provider response must be an object")
+    return value
+
 
 class ResponseMode(str, Enum):
     """Explicit trust contract for a model response."""
@@ -38,6 +50,19 @@ class ModelRecord:
     @property
     def key(self) -> str:
         return f"{self.provider}:{self.model_id}"
+
+    @property
+    def cost_classification(self) -> str:
+        costs = (self.input_cost, self.output_cost)
+        if any(cost is not None and cost > 0 for cost in costs):
+            return "PAID — BLOCKED"
+        if costs != (0, 0):
+            return "COST UNKNOWN — BLOCKED"
+        return "LOCAL FREE" if self.privacy == "local" else "REMOTE FREE"
+
+    @property
+    def zero_cost_eligible(self) -> bool:
+        return self.input_cost == 0 and self.output_cost == 0
 
 
 class HTTPModelProvider:
@@ -70,7 +95,7 @@ class HTTPModelProvider:
         call = urllib.request.Request(endpoint, json.dumps(body).encode(), headers=headers)
         try:
             with urllib.request.urlopen(call, timeout=60) as response:
-                payload = json.load(response)
+                payload = _bounded_json(response)
         except Exception:
             # Provider responses can reflect requests and keys; never include their body/message.
             raise RuntimeError("model provider request failed") from None
@@ -103,7 +128,7 @@ class HTTPModelProvider:
             headers = {"Authorization": f"Bearer {self.api_key}"}
         try:
             with urllib.request.urlopen(urllib.request.Request(url, headers=headers), timeout=20) as response:
-                payload = json.load(response)
+                payload = _bounded_json(response)
             return payload.get("models", payload.get("data", []))
         except Exception:
             return []
@@ -113,20 +138,21 @@ class ModelRouter:
     """Evidence-driven routing; no colony is pinned to a provider or function."""
 
     def choose(self, records: list[ModelRecord], task: str, *, privacy: bool = False,
-               exclude: set[str] | None = None, policy: str = "AUTO",
+               exclude: set[str] | None = None, policy: str = "ZERO_COST",
                requires_tools: bool = False, min_context: int = 0,
                required_modality: str = "text") -> ModelRecord:
-        candidates = [r for r in records if r.availability and r.key not in (exclude or set())]
+        candidates = [r for r in records if r.availability and r.zero_cost_eligible
+                      and r.key not in (exclude or set())]
         candidates = [r for r in candidates if (not requires_tools or r.tool_capability)
                       and (r.context_capability is None or r.context_capability >= min_context)
                       and required_modality in r.modalities]
         if not candidates:
-            candidates = [r for r in records if r.availability
+            candidates = [r for r in records if r.availability and r.zero_cost_eligible
                           and (not requires_tools or r.tool_capability)
                           and (r.context_capability is None or r.context_capability >= min_context)
                           and required_modality in r.modalities]
         if not candidates:
-            raise RuntimeError("no available model is configured")
+            raise RuntimeError("NO_FREE_INTELLIGENCE_AVAILABLE")
         def score(r: ModelRecord) -> tuple[float, str]:
             quality = r.task_performance.get(task, r.calibration)
             reliability = (r.successes + 1) / (r.successes + r.failures + 2)
@@ -136,12 +162,12 @@ class ModelRouter:
             known_free = r.input_cost == 0 and r.output_cost == 0
             preference = (1.0 if policy == "LOCAL_FIRST" and r.privacy == "local" else
                           1.0 if policy == "FREE_FIRST" and known_free else
-                          .15 if policy == "AUTO" and r.model_id == "openrouter/free" else 0.0)
+                          .15 if policy == "ZERO_COST" and r.privacy == "local" else 0.0)
             return preference + quality + reliability - cost - latency - privacy_penalty, r.key
         return max(candidates, key=score)
 
     @staticmethod
-    def reason(record: ModelRecord, task: str, policy: str = "AUTO") -> str:
+    def reason(record: ModelRecord, task: str, policy: str = "ZERO_COST") -> str:
         """A short, inspectable routing explanation based only on routing evidence."""
         parts = [f"available for {task}"]
         if record.privacy == "local": parts.append("local privacy")

@@ -53,7 +53,7 @@ class RecordingPolicy(AssemblyFormationPolicy):
 def runtime(path: Path, policy=None) -> GodRuntime:
     policy = policy or AssemblyFormationPolicy()
     return GodRuntime(path, {"alpha": ScriptedOrgan("A"), "beta": ScriptedOrgan("B")},
-                      [ModelRecord("alpha", "one"), ModelRecord("beta", "two")],
+                      [ModelRecord("alpha", "one", input_cost=0, output_cost=0), ModelRecord("beta", "two", input_cost=0, output_cost=0)],
                       formation_policy=policy, secret="awakening-test-key")
 
 
@@ -157,7 +157,7 @@ class SameProviderOrgan:
 def test_same_provider_routes_actual_models_and_cosmetic_difference_skips_audit(tmp_path: Path) -> None:
     organ = SameProviderOrgan(cosmetic=True)
     organism = GodRuntime(tmp_path, {"shared": organ},
-                          [ModelRecord("shared", "model-one"), ModelRecord("shared", "model-two")],
+                          [ModelRecord("shared", "model-one", input_cost=0, output_cost=0), ModelRecord("shared", "model-two", input_cost=0, output_cost=0)],
                           secret="test-key")
     episode = organism.submit_goal("Find a realistic way to compare harmless wording")
     assert set(organ.model_ids) == {"model-one", "model-two"}
@@ -182,7 +182,7 @@ class ProbeProvider:
     def catalog(self) -> list[dict]:
         return [{"id": "chosen", "context_length": 8192,
                  "architecture": {"input_modalities": ["text", "image"]},
-                 "pricing": {"prompt": "0.000001", "completion": "0.000002"}}]
+                "pricing": {"prompt": "0", "completion": "0"}}]
 
 
 def test_connection_probe_metadata_and_visible_chat_restart(tmp_path: Path,
@@ -196,9 +196,9 @@ def test_connection_probe_metadata_and_visible_chat_restart(tmp_path: Path,
     assert "Saphira-A INITIALIZED" in failed.status() and "Root AUDIT VERIFIED" in failed.status()
     assert "Intelligence DISCONNECTED" in failed.status()
     assert failed.runtime.organism.memory is not None
-    with pytest.raises(ProviderUnavailable, match="disconnected"):
+    with pytest.raises(ProviderUnavailable, match="NO_FREE_INTELLIGENCE_AVAILABLE"):
         failed.runtime.submit_goal("reason without an organ")
-    with pytest.raises(ProviderUnavailable, match="disconnected"):
+    with pytest.raises(ProviderUnavailable, match="NO_FREE_INTELLIGENCE_AVAILABLE"):
         failed.chat("try to reason")
     assert not failed.runtime.store.rows("SELECT * FROM episodes")
     with pytest.raises(RuntimeError): failed.connect(values)
@@ -209,7 +209,7 @@ def test_connection_probe_metadata_and_visible_chat_restart(tmp_path: Path,
     assert {name: colony.id for name, colony in failed.runtime.organism.colonies.items()} == identities
     record = next(iter(failed.runtime.records.values()))
     assert record.context_capability == 8192 and record.modalities == ["text", "image"]
-    assert record.input_cost == .000001 and record.output_cost == .000002
+    assert record.input_cost == 0 and record.output_cost == 0
     assert "Intelligence CONNECTED" in failed.status()
     assert failed.chat("hello") == "persist me"
     failed.close()
@@ -220,7 +220,7 @@ def test_connection_probe_metadata_and_visible_chat_restart(tmp_path: Path,
     assert "Saphira-A INITIALIZED" in restored.status() and "Root AUDIT VERIFIED" in restored.status()
     assert "Intelligence DISCONNECTED" in restored.status()
     assert "Pier: hello" in restored.transcript and "G.O.D.: persist me" in restored.transcript
-    with pytest.raises(ProviderUnavailable, match="disconnected"):
+    with pytest.raises(ProviderUnavailable, match="NO_FREE_INTELLIGENCE_AVAILABLE"):
         restored.runtime.submit_goal("still cannot reason")
 
     ProbeProvider.valid = True
@@ -233,7 +233,7 @@ def test_connection_probe_metadata_and_visible_chat_restart(tmp_path: Path,
 def test_verified_quality_requires_explicit_outcome() -> None:
     from tmco.models import ModelRouter
 
-    record = ModelRecord("provider", "model")
+    record = ModelRecord("provider", "model", input_cost=0, output_cost=0)
     ModelRouter.observe_call(record, True, 12)
     assert record.successes == 1 and record.availability
     assert record.task_performance == {} and record.calibration == .5

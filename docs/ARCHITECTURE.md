@@ -18,6 +18,12 @@ owner-authored text and compact operational/public context. Credentials, Root st
 private state, raw reasoning, and workspace file contents are not model context. Local Ollama
 is discovered only when already installed and populated; the runtime never installs it.
 
+The permanent owner monetary budget defaults to exactly zero. Routing eligibility requires
+both input and output prices to be explicitly zero; positive pricing is `PAID — BLOCKED` and
+missing or ambiguous pricing is `COST UNKNOWN — BLOCKED`. Exhaustion or failure may fall over
+only to another eligible zero-cost record, otherwise the result is
+`NO_FREE_INTELLIGENCE_AVAILABLE`. Account credit is not spending authorization.
+
 ### Root and authority
 
 `RootKernel` is the signed authorization boundary and remains outside cognition and evolution. `RootSecretStore` separates its secret from checkpoint/event state (mode-0600 on POSIX and a DPAPI current-user protected blob on Windows); persisted state contains only its fingerprint/reference. `RootGuard` exposes bounded signing and verification. The HMAC-chained audit detects mutation, and restored permissions derive from signed grants rather than checkpoint claims.

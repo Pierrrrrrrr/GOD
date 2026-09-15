@@ -11,7 +11,7 @@ import pytest
 from tmco.models import HTTPModelProvider
 from tmco.awakening import GodRuntime
 from tmco.models import ModelRecord
-from tmco.web import serve
+from tmco.web import App, serve
 
 
 class _Response:
@@ -55,7 +55,7 @@ def test_conversation_fails_over_without_leaking_provider_error(tmp_path: Path) 
             return self.answer if request["response_mode"] == "text" else {}
 
     runtime = GodRuntime(tmp_path, {"z-failing": Provider(), "a-working": Provider("safe answer")},
-        [ModelRecord("z-failing", "first"), ModelRecord("a-working", "second")], secret="root-test-key")
+        [ModelRecord("z-failing", "first", input_cost=0, output_cost=0), ModelRecord("a-working", "second", input_cost=0, output_cost=0)], secret="root-test-key")
     try:
         assert runtime.chat("hello") == "safe answer"
         assert any(event["kind"] == "MODEL_FAILOVER" for event in runtime.timeline())
@@ -122,3 +122,62 @@ def test_corporate_safe_http_boundary(tmp_path: Path, monkeypatch: pytest.Monkey
         server.shutdown()
         thread.join(5)
     assert not thread.is_alive()
+
+
+def test_zero_cost_router_never_selects_paid_or_unknown() -> None:
+    from tmco.models import ModelRouter
+
+    router = ModelRouter()
+    paid = ModelRecord("remote", "paid", input_cost=0.01, output_cost=0)
+    unknown = ModelRecord("remote", "unknown")
+    free = ModelRecord("remote", "free", input_cost=0, output_cost=0)
+    assert paid.cost_classification == "PAID — BLOCKED"
+    assert unknown.cost_classification == "COST UNKNOWN — BLOCKED"
+    assert free.cost_classification == "REMOTE FREE"
+    assert router.choose([paid, unknown, free], "conversation").model_id == "free"
+    with pytest.raises(RuntimeError, match="NO_FREE_INTELLIGENCE_AVAILABLE"):
+        router.choose([paid, unknown], "conversation")
+
+
+def test_zero_cost_failover_does_not_fall_back_to_paid(tmp_path: Path) -> None:
+    calls = []
+
+    class Provider:
+        def infer(self, request):
+            calls.append(request["model_id"])
+            raise RuntimeError("unavailable")
+
+    runtime = GodRuntime(tmp_path, {"remote": Provider()}, [
+        ModelRecord("remote", "free", input_cost=0, output_cost=0),
+        ModelRecord("remote", "paid", input_cost=1, output_cost=1),
+    ], secret="zero-cost-test")
+    try:
+        with pytest.raises(Exception, match="NO_FREE_INTELLIGENCE_AVAILABLE"):
+            runtime.chat("hello")
+        assert calls == ["free"]
+    finally:
+        runtime.close()
+
+
+def test_paid_manual_model_is_blocked_before_probe_or_credential_save(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    calls = []
+
+    class Catalog:
+        def __init__(self, *_args, **_kwargs): pass
+        def catalog(self):
+            return [{"id": "paid", "pricing": {"prompt": "0.1", "completion": "0"}}]
+        def infer(self, request):
+            calls.append(request)
+            return {"probe": True}
+
+    monkeypatch.setattr("tmco.web.HTTPModelProvider", Catalog)
+    app = App(tmp_path)
+    try:
+        with pytest.raises(RuntimeError, match="PAID — BLOCKED"):
+            app.connect({"provider": "OpenRouter", "model": "paid", "key": "must-not-save"})
+        assert calls == []
+        assert not app.vault.handles()
+        assert "Resource openrouter:paid — PAID — BLOCKED" in app.status()
+    finally:
+        app.close()
