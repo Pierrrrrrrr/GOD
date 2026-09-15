@@ -210,8 +210,21 @@ class DevelopmentEngine:
         need_id = uuid4().hex
         self._record("DEVELOPMENT_NEED", need_id, {"need_id": need_id, "goal_id": demand.goal_id,
                                                     "capability": demand.required_capability})
-        # Materialize both private first-pass proposals before validating either.
-        raw = [(lineage, proposer(demand)) for lineage, proposer in proposals.items()]
+        # Attempt both private first passes before persisting or validating either.
+        # Proposal failures are deliberately summarized without exception text: a
+        # provider error can contain reflected prompts, responses, or secrets.
+        raw: list[tuple[str, CompositeOrganSpec | Mapping[str, Any]]] = []
+        failures: list[tuple[str, str, str]] = []
+        for lineage, proposer in proposals.items():
+            identity = uuid4().hex
+            try:
+                raw.append((lineage, proposer(demand)))
+            except Exception as exc:
+                failures.append((lineage, identity, type(exc).__name__))
+        for lineage, identity, error_class in failures:
+            self._record("CANDIDATE_REJECTED", identity + ":proposal-failed",
+                         {"candidate_id": identity, "origin": lineage,
+                          "reason": "proposal generation failed", "error_class": error_class})
         candidates: list[DevelopmentCandidate] = []
         for lineage, proposal in raw:
             candidate: DevelopmentCandidate | None = None

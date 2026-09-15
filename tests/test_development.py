@@ -94,6 +94,44 @@ def test_failed_test_or_audit_never_mutates_registry(tmp_path: Path) -> None:
     store.close()
 
 
+def test_one_proposer_failure_does_not_block_valid_sister(tmp_path: Path) -> None:
+    bus, store, _, engine = fixture_engine(tmp_path)
+    calls = []
+    def fail(_demand):
+        calls.append("Saphira-A")
+        raise ValueError("private provider response must not be persisted")
+    def succeed(_demand):
+        calls.append("Saphira-B")
+        return valid_spec()
+    winner = engine.develop(demand(), {"Saphira-A": fail, "Saphira-B": succeed},
+                            lambda _spec, _evidence: 1, lambda auditor, *_: auditor == "Saphira-A")
+    assert calls == ["Saphira-A", "Saphira-B"]
+    assert winner is not None and winner.origin == "Saphira-B"
+    rejected = next(event for event in store.all("development_event")
+                    if event["kind"] == "CANDIDATE_REJECTED")
+    assert rejected["reason"] == "proposal generation failed"
+    assert "private provider response" not in json.dumps(rejected)
+    assert "composite:write-verified" in bus.manifests
+    store.close()
+
+
+def test_both_proposer_failures_return_none_without_promotion(tmp_path: Path) -> None:
+    bus, store, _, engine = fixture_engine(tmp_path)
+    def fail(_demand):
+        raise RuntimeError("untrusted provider detail")
+    assert engine.develop(demand(), {"Saphira-A": fail, "Saphira-B": fail},
+                          lambda *_: pytest.fail("failed proposal was tested"),
+                          lambda *_: pytest.fail("failed proposal was audited")) is None
+    rejected = [event for event in store.all("development_event")
+                if event["kind"] == "CANDIDATE_REJECTED"]
+    assert len(rejected) == 2 and {event["origin"] for event in rejected} == {"Saphira-A", "Saphira-B"}
+    assert all(event["reason"] == "proposal generation failed" for event in rejected)
+    assert "untrusted provider detail" not in json.dumps(rejected)
+    assert not store.all("composite_spec")
+    assert not any(identity.startswith("composite:") for identity in bus.manifests)
+    store.close()
+
+
 @pytest.mark.parametrize("mismatch, reason", [
     (replace(valid_spec(), capability="different-capability"), "capability"),
     (replace(valid_spec(), operation="different-operation"), "operation"),
@@ -213,6 +251,29 @@ class LiveDevelopmentProvider:
                     "hypotheses": ["compose trusted workspace operations"],
                     "next_useful_action": "write verified artifact", "body_demands": [body]}
         raise AssertionError(f"unexpected model prompt: {prompt[:80]}")
+
+
+class FailedLiveDevelopmentProvider(LiveDevelopmentProvider):
+    def infer(self, request):
+        if "Independently propose one declarative" in request["prompt"]:
+            self.calls.append(request)
+            raise ValueError("malformed private model response")
+        return super().infer(request)
+
+
+def test_live_proposal_failures_remain_an_honest_capability_gap(tmp_path: Path) -> None:
+    provider = FailedLiveDevelopmentProvider(tmp_path / "workspace")
+    runtime = GodRuntime(tmp_path, {"models": provider},
+        [ModelRecord("models", "A"), ModelRecord("models", "B")], secret="failed-development-test")
+    episode = runtime.submit_goal("Create a verified artifact through developmental composition")
+    assert episode["body"]["status"] == "gap"
+    assert runtime.operational_status()["current_step"] == "capability_gap"
+    assert len([event for event in runtime.embodiment_store.all("development_event")
+                if event["kind"] == "CANDIDATE_REJECTED"]) == 2
+    assert not runtime.embodiment_store.all("composite_spec")
+    assert not any(identity.startswith("composite:") for identity in runtime.body_bus.manifests)
+    assert "GOAL_RESUMED" not in [event["kind"] for event in runtime.timeline()]
+    runtime.close()
 
 
 def test_focused_goal_recruits_twin_development_ranks_resumes_and_restores(tmp_path: Path) -> None:
