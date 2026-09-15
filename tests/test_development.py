@@ -1,3 +1,4 @@
+import json
 from pathlib import Path
 
 import pytest
@@ -9,6 +10,7 @@ from tmco.development import (CompositeOrganSpec, CompositeRejected, CompositeSt
 from tmco.embodiment import (ActionLoop, CapabilityDemand, CapabilityResolver,
                              EmbodimentStore, ObservationEnvelope, OrganRegistry,
                              VerificationLevel, WorkspaceFilesystemOrgan)
+from tmco.models import ModelRecord
 
 
 def fixture_engine(tmp_path: Path):
@@ -85,6 +87,7 @@ def test_failed_test_or_audit_never_mutates_registry(tmp_path: Path) -> None:
     assert engine.develop(demand(), proposals, lambda _s, _e: False, lambda *_: True) is None
     assert not any(key.startswith("composite:") for key in bus.manifests)
     assert not store.all("composite_spec")
+    assert not (tmp_path / "workspace/proof.txt").exists()
     assert engine.develop(demand(), proposals, lambda _s, _e: True, lambda *_: False) is None
     assert not any(key.startswith("composite:") for key in bus.manifests)
     store.close()
@@ -109,7 +112,7 @@ def test_runtime_develops_executes_observes_and_restores_composite(tmp_path: Pat
                 "operation": "modify", "arguments": {"path": "input.path"}}]}
 
     audits = []
-    winner = runtime.develop_capability(
+    winner = runtime.development.develop(
         requested, {"Saphira-A": propose_a, "Saphira-B": propose_b},
         lambda _spec, evidence: evidence["steps"]["write"]["bytes"] == 9
                                 and len(evidence["steps"]["hash"]["sha256"]) == 64,
@@ -128,7 +131,8 @@ def test_runtime_develops_executes_observes_and_restores_composite(tmp_path: Pat
                                       VerificationLevel.ARTIFACT_VERIFIED)
     kinds = [event["kind"] for event in runtime.embodiment_store.all("development_event")]
     assert {"DEVELOPMENT_NEED", "CANDIDATE_PROPOSED", "CANDIDATE_REJECTED", "CANDIDATE_TESTED",
-            "SISTER_AUDITED", "ORGAN_PROMOTED", "GOAL_RESUMED"} <= set(kinds)
+            "SISTER_AUDITED", "ORGAN_PROMOTED"} <= set(kinds)
+    assert "GOAL_RESUMED" not in kinds  # direct engine use did not resume a live goal
     runtime.close()
 
     restored = GodRuntime(tmp_path, secret="development-test")
@@ -144,3 +148,77 @@ def test_default_live_goal_path_does_not_form_legacy_neuron_assemblies(tmp_path:
     runtime = GodRuntime(tmp_path, secret="no-legacy-formation")
     assert runtime.policy is None
     runtime.close()
+
+
+class LiveDevelopmentProvider:
+    def __init__(self, workspace: Path):
+        self.workspace, self.calls = workspace, []
+
+    def infer(self, request):
+        self.calls.append(request)
+        prompt = request["prompt"]
+        context = json.loads(prompt.split("JSON context:\n", 1)[1])
+        if "Independently propose one declarative" in prompt:
+            assert set(context) == {"demand", "trusted_catalog", "composite_organ_contract", "security"}
+            assert "candidate" not in context and "sister" not in context
+            final = "exists" if request["model_id"] == "A" else "hash"
+            steps = [{"id": "write", "organ": "workspace", "operation": "write",
+                      "arguments": {"path": "input.path", "content": "input.content"}},
+                     {"id": final, "organ": "workspace", "operation": final,
+                      "arguments": {"path": "input.path"}}]
+            return {"composite_organ": {"id": f"composite:verified-{final}",
+                    "capability": "verified-artifact", "operation": "write_verified",
+                    "required_inputs": ["path", "content"], "steps": steps,
+                    "description": f"write then {final}", "version": "1"}}
+        if "Audit this tested declarative" in prompt:
+            # Candidate tests were disposable: the live workspace is still untouched.
+            assert not (self.workspace / "live-proof.txt").exists()
+            assert set(context) == {"candidate_origin", "candidate", "objective_evidence"}
+            return {"approved": True}
+        if "Assess only whether" in prompt:
+            return {"material_disagreement": False, "reasons": []}
+        if "Reason independently" in prompt:
+            body = {"required_capability": "verified-artifact", "intent": "write_verified",
+                    "inputs": {"path": "live-proof.txt", "content": "created by resumed goal"},
+                    "expected_output": "written artifact and digest", "expected_evidence": "sha256",
+                    "risk": 1, "side_effect_class": "workspace", "budget": 2,
+                    "reversibility": True, "confidence": .9, "goal_value": 3,
+                    "information_gain": 1, "capability_gain": 1, "uncertainty": .1,
+                    "network_need": "none", "filesystem_need": "workspace"}
+            return {"desired_outcome": "verified artifact", "success_evidence": ["sha256"],
+                    "constraints": [], "unknowns": [], "risks": [], "subgoals": [],
+                    "hypotheses": ["compose trusted workspace operations"],
+                    "next_useful_action": "write verified artifact", "body_demands": [body]}
+        raise AssertionError(f"unexpected model prompt: {prompt[:80]}")
+
+
+def test_normal_goal_develops_ranks_resumes_and_restores(tmp_path: Path) -> None:
+    provider = LiveDevelopmentProvider(tmp_path / "workspace")
+    runtime = GodRuntime(tmp_path, {"models": provider},
+        [ModelRecord("models", "A"), ModelRecord("models", "B")], secret="live-development-test")
+    episode = runtime.submit_goal("Audit a verified artifact through developmental composition")
+    proposed = runtime.embodiment_store.all("development_candidate")
+    assert {item["origin"] for item in proposed} == {"Saphira-A", "Saphira-B"}
+    # B was proposed second but wins because a real digest scores above existence evidence.
+    promoted = runtime.embodiment_store.all("composite_spec")
+    assert [item["id"] for item in promoted] == ["composite:verified-hash"]
+    observations = runtime.embodiment_store.all("observation")
+    composite_observation = next(item for item in observations if item["organ"] == "composite:verified-hash")
+    assert composite_observation["verification_state"] == VerificationLevel.ARTIFACT_VERIFIED.value
+    assert (tmp_path / "workspace/live-proof.txt").read_text() == "created by resumed goal"
+    assert episode["body"]["status"] == "executed"
+    events = runtime.embodiment_store.all("development_event")
+    resumed = next(item for item in events if item["kind"] == "GOAL_RESUMED")
+    assert resumed["action_id"] == composite_observation["action_id"]
+    timeline = [item["kind"] for item in runtime.timeline()]
+    assert timeline.index("OBSERVATION_RECEIVED") < timeline.index("GOAL_RESUMED")
+    gaps = runtime.embodiment_store.all("gap")
+    assert gaps and gaps[0]["demand"]["id"] == resumed["demand_id"]
+    assert len([call for call in provider.calls if "Independently propose one declarative" in call["prompt"]]) == 2
+    runtime.close()
+
+    restored = GodRuntime(tmp_path, secret="live-development-test")
+    original = CapabilityDemand(**gaps[0]["demand"])
+    resolved = restored.capability_resolver.resolve(original)
+    assert resolved is not None and resolved[0].id == "composite:verified-hash"
+    restored.close()

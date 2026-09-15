@@ -212,12 +212,76 @@ class GodRuntime:
     def _development_event(self, kind: str, state: dict[str, Any]) -> None:
         self._event(kind, kind.replace("_", " ").title(), state)
 
-    def develop_capability(self, demand: CapabilityDemand, proposals: dict[str, Any],
-                           evaluator: Any, auditor: Any) -> DevelopmentCandidate | None:
-        """Run the bounded developmental path, then leave normal resolution to the caller."""
-        if set(proposals) != {"Saphira-A", "Saphira-B"}:
-            raise ValueError("independent proposals from both sister lineages are required")
-        return self.development.develop(demand, proposals, evaluator, auditor)
+    def _composable_catalog(self) -> list[dict[str, Any]]:
+        catalog = []
+        for manifest in sorted(self.body_bus.manifests.values(), key=lambda item: item.id):
+            boundary = f"{manifest.id} {manifest.kind}".lower()
+            if (not manifest.available or not manifest.trusted
+                    or any(token in boundary for token in ("root", "credential", "vault", "shell"))):
+                continue
+            catalog.append({"organ": manifest.id, "kind": manifest.kind,
+                            "operations": manifest.operations,
+                            "permissions": sorted(manifest.permissions), "risk": manifest.risk,
+                            "side_effect_class": manifest.side_effect_class,
+                            "reversible": manifest.reversible, "cost": manifest.cost})
+        return catalog
+
+    @staticmethod
+    def _objective_composite_score(_spec: Any, evidence: dict[str, Any]) -> float:
+        steps = evidence.get("steps")
+        if not isinstance(steps, dict) or not steps: return 0
+        score = 1.0
+        for result in steps.values():
+            if not isinstance(result, dict) or not result: return 0
+            score += sum(value not in (None, "", False) for value in result.values())
+            if isinstance(result.get("sha256"), str) and len(result["sha256"]) == 64: score += 4
+        return score
+
+    @staticmethod
+    def _compact_development_evidence(evidence: dict[str, Any]) -> dict[str, Any]:
+        compact: dict[str, Any] = {}
+        for step, result in evidence.get("steps", {}).items():
+            if isinstance(result, dict):
+                compact[step] = {key: (value[:128] if isinstance(value, str) else value)
+                                 for key, value in result.items() if key in {"path", "bytes", "size", "exists", "sha256"}}
+        return compact
+
+    def _develop_gap(self, demand: CapabilityDemand, interpretations: dict[str, dict[str, Any]]) -> DevelopmentCandidate | None:
+        if (demand.network_need != "none" or demand.filesystem_need not in {"workspace", "none"}
+                or set(interpretations) != {"Saphira-A", "Saphira-B"}):
+            return None
+        catalog = self._composable_catalog()
+        contract = {"id": "composite:<name>", "capability": demand.required_capability,
+                    "operation": demand.intent, "required_inputs": sorted(demand.inputs),
+                    "steps": [{"id": "unique-step", "organ": "catalog organ", "operation": "catalog operation",
+                               "arguments": {"argument": "input.<name> or steps.<prior-step>.<field>"}}],
+                    "description": "compact purpose", "version": "1"}
+        proposals: dict[str, Any] = {}
+        for lineage in ("Saphira-A", "Saphira-B"):
+            record = self.records[interpretations[lineage]["model"]]
+            def propose(_demand: CapabilityDemand, *, lineage=lineage, record=record):
+                response = self._model_call(record, demand.goal_id, None, "capability_development", lineage,
+                    "Independently propose one declarative CompositeOrganSpec. Return only a JSON object under "
+                    "composite_organ. Use only catalog operations and reference syntax from the contract. Do not "
+                    "return reasoning, Python, shell, credentials, Root data, network targets, or executable code.",
+                    {"demand": asdict(demand), "trusted_catalog": catalog,
+                     "composite_organ_contract": contract,
+                     "security": ["registered trusted operations only", "no recursion or cycles",
+                                  "no Root, credentials, shell, code, privilege grants, or scope expansion"]})
+                proposal = response.get("composite_organ")
+                if not isinstance(proposal, dict): raise ValueError("model did not return a composite_organ object")
+                return proposal
+            proposals[lineage] = propose
+
+        def audit(auditor: str, origin: str, spec: Any, evidence: dict[str, Any]) -> bool:
+            record = self.records[interpretations[auditor]["model"]]
+            response = self._model_call(record, demand.goal_id, None, "capability_development_audit", auditor,
+                "Audit this tested declarative candidate using only its compact spec and objective evidence. "
+                "Return approved as a JSON boolean. Do not return private reasoning.",
+                {"candidate_origin": origin, "candidate": asdict(spec),
+                 "objective_evidence": self._compact_development_evidence(evidence)})
+            return response.get("approved") is True
+        return self.development.develop(demand, proposals, self._objective_composite_score, audit)
 
     def _restore_exchange_rounds(self) -> None:
         for event in self.embodiment_store.all("exchange"):
@@ -484,6 +548,7 @@ class GodRuntime:
         for _, demand, raw in candidates:
             if demand.intent in seen: continue
             seen.add(demand.intent)
+            winner = None
             provenance = next((item for item in self.embodiment_store.all("decision_provenance")
                                if item["id"] == demand.decision_provenance_id), {})
             acting_colony = provenance.get("source_colony")
@@ -494,6 +559,17 @@ class GodRuntime:
                 state["current_organ"] = resolved[0].id; self.store.put("goals", state["id"], state)
                 self._event("CAPABILITY_RESOLVED", f"Demand resolved to {resolved[0].id}",
                             {"goal_id": state["id"], "organ": resolved[0].id})
+            else:
+                state.update(current_step="capability_gap"); self.store.put("goals", state["id"], state)
+                self._event("CAPABILITY_GAP", "No safe compatible organ", {"goal_id": state["id"], "demand_id": demand.id})
+                winner = self._develop_gap(demand, interpretations)
+                resolved = self.capability_resolver.resolve(demand) if winner is not None else None
+                if resolved is None:
+                    return {"status":"gap"}
+                state.update(current_step="body_execution", current_organ=resolved[0].id)
+                self.store.put("goals", state["id"], state)
+                self._event("CAPABILITY_RESOLVED", f"Developed demand resolved to {resolved[0].id}",
+                            {"goal_id": state["id"], "organ": resolved[0].id, "demand_id": demand.id})
             result = self.action_loop.execute(demand)
             if isinstance(result, HumanApprovalRequest):
                 state.update(current_step="pending_approval", pending_approval=result.id); self.store.put("goals",state["id"],state)
@@ -501,7 +577,6 @@ class GodRuntime:
                 return {"status":"pending_approval","request":asdict(result)}
             if not isinstance(result, ObservationEnvelope):
                 state.update(current_step="capability_gap"); self.store.put("goals",state["id"],state)
-                self._event("CAPABILITY_GAP", "No safe compatible organ", {"goal_id": state["id"], "demand_id": demand.id})
                 return {"status":"gap"}
             if acting_colony: self._sister_transition(acting_colony, state["id"], "ACTING", "Body operation invoked")
             if acting_colony: self._sister_transition(acting_colony, state["id"], "VERIFYING", "Checking body observation")
@@ -515,6 +590,8 @@ class GodRuntime:
             if verified:
                 manifest = self.body_bus.manifests[result.organ]
                 manifest.verified_reliability = min(1, manifest.verified_reliability + .01)
+                if winner is not None:
+                    self.development.record_resumed(winner, demand, result.action_id)
             observations.append(asdict(result)); state["last_observation"] = result.action_id
             if verified and demand.required_capability == "filesystem" and demand.intent in {"write", "append"}:
                 for check in ("exists", "hash"):

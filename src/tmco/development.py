@@ -1,13 +1,17 @@
 """Safe, declarative development of reusable BodyBus compositions."""
 from __future__ import annotations
 
+import json
+import tempfile
 import time
 from dataclasses import asdict, dataclass, field
+from pathlib import Path
 from typing import Any, Callable, Mapping
 from uuid import uuid4
 
 from .buses import BodyBus, OrganManifest
-from .embodiment import CapabilityDemand, EmbodimentStore, OrganRegistry
+from .embodiment import (CapabilityDemand, EmbodimentStore, OrganRegistry,
+                         WorkspaceFilesystemOrgan)
 
 
 class CompositeRejected(ValueError):
@@ -40,6 +44,7 @@ class DevelopmentCandidate:
     origin: str
     spec: CompositeOrganSpec
     tested: bool = False
+    objective_score: float = 0
     evidence: dict[str, Any] = field(default_factory=dict)
     audit_by: str | None = None
 
@@ -146,6 +151,27 @@ class DevelopmentEngine:
             results[step.id] = self.bus.request(step.organ, step.operation, arguments)
         return {"steps": results, "final": results[spec.steps[-1].id]}
 
+    def _test_isolated(self, spec: CompositeOrganSpec, inputs: dict[str, Any]) -> dict[str, Any]:
+        """Run only workspace-compatible primitives against a disposable body."""
+        parts = [self.bus.manifests[step.organ] for step in spec.steps]
+        if any(part.kind != "filesystem" for part in parts):
+            raise CompositeRejected("candidate constituents cannot be safely isolated")
+        with tempfile.TemporaryDirectory(prefix="god-composite-test-") as directory:
+            test_bus = BodyBus()
+            isolated = WorkspaceFilesystemOrgan(Path(directory))
+            for manifest in {part.id: part for part in parts}.values():
+                operations = set(step.operation for step in spec.steps if step.organ == manifest.id)
+                if not operations <= set(isolated.OPERATIONS):
+                    raise CompositeRejected("filesystem operation has no isolated test implementation")
+                test_bus.register(manifest, {operation: (lambda args, operation=operation:
+                    isolated.handle(operation, args)) for operation in operations})
+            test_store = EmbodimentStore(Path(directory) / "test.sqlite3")
+            try:
+                test_engine = DevelopmentEngine(test_bus, test_store, OrganRegistry(test_bus, test_store))
+                return test_engine._execute(spec, inputs)
+            finally:
+                test_store.close()
+
     def attach(self, spec: CompositeOrganSpec) -> OrganManifest:
         manifest = self.validate(spec)
         self.registry.register(manifest, {spec.operation: lambda inputs, s=spec: self._execute(s, inputs)})
@@ -161,9 +187,14 @@ class DevelopmentEngine:
                 pending.remove(spec); progressed = True
             if not progressed: break  # unavailable dependencies remain unavailable, never half-attached
 
+    def record_resumed(self, candidate: DevelopmentCandidate, demand: CapabilityDemand, action_id: str) -> None:
+        """Record continuation only after the promoted organ produced an observation."""
+        self._record("GOAL_RESUMED", candidate.id + ":resumed",
+                     {"goal_id": demand.goal_id, "demand_id": demand.id, "action_id": action_id})
+
     def develop(self, demand: CapabilityDemand,
                 proposals: Mapping[str, Callable[[CapabilityDemand], CompositeOrganSpec | Mapping[str, Any]]],
-                evaluator: Callable[[CompositeOrganSpec, dict[str, Any]], bool],
+                evaluator: Callable[[CompositeOrganSpec, dict[str, Any]], float | bool],
                 auditor: Callable[[str, str, CompositeOrganSpec, dict[str, Any]], bool]) -> DevelopmentCandidate | None:
         need_id = uuid4().hex
         self._record("DEVELOPMENT_NEED", need_id, {"need_id": need_id, "goal_id": demand.goal_id,
@@ -179,8 +210,10 @@ class DevelopmentEngine:
                 self._record("CANDIDATE_PROPOSED", candidate.id + ":proposed",
                              {"candidate_id": candidate.id, "origin": lineage, "spec_id": candidate.spec.id})
                 self.validate(candidate.spec)
-                evidence = self._execute(candidate.spec, demand.inputs)
-                candidate.tested = bool(evaluator(candidate.spec, evidence)); candidate.evidence = evidence
+                evidence = self._test_isolated(candidate.spec, demand.inputs)
+                evaluation = evaluator(candidate.spec, evidence)
+                candidate.objective_score = float(evaluation)
+                candidate.tested = candidate.objective_score > 0; candidate.evidence = evidence
                 self.store.put("development_candidate", candidate.id, candidate)
                 self._record("CANDIDATE_TESTED", candidate.id + ":tested",
                              {"candidate_id": candidate.id, "passed": candidate.tested})
@@ -190,6 +223,10 @@ class DevelopmentEngine:
                 identity = candidate.id if candidate is not None else uuid4().hex
                 self._record("CANDIDATE_REJECTED", identity + ":rejected",
                              {"candidate_id": identity, "origin": lineage, "reason": str(exc)})
+        # Evidence score wins; canonical declarative structure is a neutral,
+        # deterministic tie-breaker that does not encode proposal/lineage order.
+        candidates.sort(key=lambda item: (item.objective_score,
+            json.dumps(asdict(item.spec), sort_keys=True, separators=(",", ":"))), reverse=True)
         for candidate in candidates:
             sisters = [name for name in proposals if name != candidate.origin]
             if not sisters: continue
@@ -208,6 +245,5 @@ class DevelopmentEngine:
             self.store.put("development_candidate", candidate.id, candidate)
             self._record("ORGAN_PROMOTED", candidate.id + ":promoted",
                          {"candidate_id": candidate.id, "organ": candidate.spec.id})
-            self._record("GOAL_RESUMED", candidate.id + ":resumed", {"goal_id": demand.goal_id, "demand_id": demand.id})
             return candidate
         return None
