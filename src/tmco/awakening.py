@@ -17,6 +17,7 @@ from .embodiment import (ActionLoop, CapabilityDemand, CapabilityResolver, Embod
                          VerificationLevel, WebResearchOrgan,
                          WorkspaceFilesystemOrgan)
 from .executive import Cognition
+from .development import DevelopmentCandidate, DevelopmentEngine
 from .models import ModelRecord, ModelRouter
 from .morphogenesis import AssemblyFormationPolicy
 from .system import TMCOSystem
@@ -157,7 +158,9 @@ class GodRuntime:
         self.records: dict[str, ModelRecord] = {}
         self.routing_policy = "AUTO"
         self.cognition: Cognition = DisconnectedCognition()
-        self.policy = formation_policy or AssemblyFormationPolicy()
+        # DigitalNeuron formation remains an opt-in legacy experiment. Live body
+        # capability resolution and development do not depend on it.
+        self.policy = formation_policy
         # Existing Phase 1 state format remains the authority for organism identity/neural state.
         self.organism = TMCOSystem(directory / "organism", self.cognition, secret=secret,
                                    formation_policy=self.policy)
@@ -174,6 +177,9 @@ class GodRuntime:
         self.sister_exchange = SisterExchangePolicy()
         self._restore_exchange_rounds()
         self._register_builtin_organs(web_test_allow_hosts)
+        self.development = DevelopmentEngine(self.body_bus, self.embodiment_store,
+                                             self.organ_registry, self._development_event)
+        self.development.restore()
         self._event("BOOT", "Root and both sister lineages restored")
         for name in ("Saphira-A", "Saphira-B"):
             if not self.store.rows("SELECT 1 FROM sister_states WHERE colony=? LIMIT 1", (name,)):
@@ -202,6 +208,88 @@ class GodRuntime:
                      "VERIFICATION_CHANGED": "Observation verification changed",
                      "FAILED": "Body invocation failed"}
         self._event(kind, summaries[kind], state)
+
+    def _development_event(self, kind: str, state: dict[str, Any]) -> None:
+        self._event(kind, kind.replace("_", " ").title(), state)
+
+    def _composable_catalog(self) -> list[dict[str, Any]]:
+        catalog = []
+        for manifest in sorted(self.body_bus.manifests.values(), key=lambda item: item.id):
+            boundary = f"{manifest.id} {manifest.kind}".lower()
+            if (not manifest.available or not manifest.trusted
+                    or any(token in boundary for token in ("root", "credential", "vault", "shell"))):
+                continue
+            catalog.append({"organ": manifest.id, "kind": manifest.kind,
+                            "operations": manifest.operations,
+                            "permissions": sorted(manifest.permissions), "risk": manifest.risk,
+                            "side_effect_class": manifest.side_effect_class,
+                            "reversible": manifest.reversible, "cost": manifest.cost})
+        return catalog
+
+    @staticmethod
+    def _objective_composite_score(_spec: Any, evidence: dict[str, Any]) -> float:
+        steps = evidence.get("steps")
+        if not isinstance(steps, dict) or not steps: return 0
+        score = 1.0
+        for result in steps.values():
+            if not isinstance(result, dict) or not result: return 0
+            score += sum(value not in (None, "", False) for value in result.values())
+            if isinstance(result.get("sha256"), str) and len(result["sha256"]) == 64: score += 4
+        return score
+
+    @staticmethod
+    def _compact_development_evidence(evidence: dict[str, Any]) -> dict[str, Any]:
+        compact: dict[str, Any] = {}
+        for step, result in evidence.get("steps", {}).items():
+            if isinstance(result, dict):
+                compact[step] = {key: (value[:128] if isinstance(value, str) else value)
+                                 for key, value in result.items() if key in {"path", "bytes", "size", "exists", "sha256"}}
+        return compact
+
+    def _develop_gap(self, demand: CapabilityDemand, interpretations: dict[str, dict[str, Any]]) -> DevelopmentCandidate | None:
+        if (demand.network_need != "none" or demand.filesystem_need not in {"workspace", "none"}
+                or not interpretations):
+            return None
+        catalog = self._composable_catalog()
+        contract = {"id": "composite:<name>", "capability": demand.required_capability,
+                    "operation": demand.intent, "required_inputs": sorted(demand.inputs),
+                    "steps": [{"id": "unique-step", "organ": "catalog organ", "operation": "catalog operation",
+                               "arguments": {"argument": "input.<name> or steps.<prior-step>.<field>"}}],
+                    "description": "compact purpose", "version": "1"}
+        proposals: dict[str, Any] = {}
+        development_records: dict[str, ModelRecord] = {}
+        used = {view["model"] for view in interpretations.values()}
+        for lineage in ("Saphira-A", "Saphira-B"):
+            if lineage in interpretations:
+                record = self.records[interpretations[lineage]["model"]]
+            else:
+                record = self.router.choose(list(self.records.values()), "capability_development",
+                                            exclude=used, policy=self.routing_policy)
+                used.add(record.key)
+            development_records[lineage] = record
+            def propose(_demand: CapabilityDemand, *, lineage=lineage, record=record):
+                response = self._model_call(record, demand.goal_id, None, "capability_development", lineage,
+                    "Independently propose one declarative CompositeOrganSpec. Return only a JSON object under "
+                    "composite_organ. Use only catalog operations and reference syntax from the contract. Do not "
+                    "return reasoning, Python, shell, credentials, Root data, network targets, or executable code.",
+                    {"demand": asdict(demand), "trusted_catalog": catalog,
+                     "composite_organ_contract": contract,
+                     "security": ["registered trusted operations only", "no recursion or cycles",
+                                  "no Root, credentials, shell, code, privilege grants, or scope expansion"]})
+                proposal = response.get("composite_organ")
+                if not isinstance(proposal, dict): raise ValueError("model did not return a composite_organ object")
+                return proposal
+            proposals[lineage] = propose
+
+        def audit(auditor: str, origin: str, spec: Any, evidence: dict[str, Any]) -> bool:
+            record = development_records[auditor]
+            response = self._model_call(record, demand.goal_id, None, "capability_development_audit", auditor,
+                "Audit this tested declarative candidate using only its compact spec and objective evidence. "
+                "Return approved as a JSON boolean. Do not return private reasoning.",
+                {"candidate_origin": origin, "candidate": asdict(spec),
+                 "objective_evidence": self._compact_development_evidence(evidence)})
+            return response.get("approved") is True
+        return self.development.develop(demand, proposals, self._objective_composite_score, audit)
 
     def _restore_exchange_rounds(self) -> None:
         for event in self.embodiment_store.all("exchange"):
@@ -293,8 +381,9 @@ class GodRuntime:
         goal = Goal(goal_id, text, ("credible evidence of progress",))
         work_class = classify_work(text)
         self._event("WORK_CLASS_SELECTED", f"Work classified as {work_class.value}", {"goal_id": goal_id})
-        decisions = self.policy.form(self.organism.colonies, goal,
-                                     {name: ComputeBudget(8) for name in self.organism.colonies})
+        decisions = (self.policy.form(self.organism.colonies, goal,
+                                      {name: ComputeBudget(8) for name in self.organism.colonies})
+                     if self.policy is not None else [])
         interpretations: dict[str, dict[str, Any]] = {}
         used: set[str] = set()
         colonies = (list(self.organism.colonies.items()) if work_class == WorkClass.DELIBERATIVE and important
@@ -442,6 +531,10 @@ class GodRuntime:
                     str(data["expected_evidence"]), float(data["confidence"]), float(data["goal_value"]),
                     float(data["information_gain"]), float(data["capability_gain"]), float(data["uncertainty"]))
                 neuron_ids = tuple(n for decision in decisions if decision.colony_name == source_colony for n in decision.neuron_ids)
+                # Outcome attribution remains compatible with the persisted Phase-1
+                # substrate without requiring heuristic assembly formation.
+                if not neuron_ids:
+                    neuron_ids = (next(iter(self.organism.colonies[source_colony].neurons)),)
                 assembly_ids = tuple(decision.assembly_id for decision in decisions if decision.colony_name == source_colony)
                 provenance = DecisionProvenance(uuid4().hex, goal_id, episode_id, source_colony,
                     view["model"], assembly_ids, neuron_ids, demand.id, time.time())
@@ -463,6 +556,7 @@ class GodRuntime:
         for _, demand, raw in candidates:
             if demand.intent in seen: continue
             seen.add(demand.intent)
+            winner = None
             provenance = next((item for item in self.embodiment_store.all("decision_provenance")
                                if item["id"] == demand.decision_provenance_id), {})
             acting_colony = provenance.get("source_colony")
@@ -473,6 +567,17 @@ class GodRuntime:
                 state["current_organ"] = resolved[0].id; self.store.put("goals", state["id"], state)
                 self._event("CAPABILITY_RESOLVED", f"Demand resolved to {resolved[0].id}",
                             {"goal_id": state["id"], "organ": resolved[0].id})
+            else:
+                state.update(current_step="capability_gap"); self.store.put("goals", state["id"], state)
+                self._event("CAPABILITY_GAP", "No safe compatible organ", {"goal_id": state["id"], "demand_id": demand.id})
+                winner = self._develop_gap(demand, interpretations)
+                resolved = self.capability_resolver.resolve(demand) if winner is not None else None
+                if resolved is None:
+                    return {"status":"gap"}
+                state.update(current_step="body_execution", current_organ=resolved[0].id)
+                self.store.put("goals", state["id"], state)
+                self._event("CAPABILITY_RESOLVED", f"Developed demand resolved to {resolved[0].id}",
+                            {"goal_id": state["id"], "organ": resolved[0].id, "demand_id": demand.id})
             result = self.action_loop.execute(demand)
             if isinstance(result, HumanApprovalRequest):
                 state.update(current_step="pending_approval", pending_approval=result.id); self.store.put("goals",state["id"],state)
@@ -480,7 +585,6 @@ class GodRuntime:
                 return {"status":"pending_approval","request":asdict(result)}
             if not isinstance(result, ObservationEnvelope):
                 state.update(current_step="capability_gap"); self.store.put("goals",state["id"],state)
-                self._event("CAPABILITY_GAP", "No safe compatible organ", {"goal_id": state["id"], "demand_id": demand.id})
                 return {"status":"gap"}
             if acting_colony: self._sister_transition(acting_colony, state["id"], "ACTING", "Body operation invoked")
             if acting_colony: self._sister_transition(acting_colony, state["id"], "VERIFYING", "Checking body observation")
@@ -494,6 +598,8 @@ class GodRuntime:
             if verified:
                 manifest = self.body_bus.manifests[result.organ]
                 manifest.verified_reliability = min(1, manifest.verified_reliability + .01)
+                if winner is not None:
+                    self.development.record_resumed(winner, demand, result.action_id)
             observations.append(asdict(result)); state["last_observation"] = result.action_id
             if verified and demand.required_capability == "filesystem" and demand.intent in {"write", "append"}:
                 for check in ("exists", "hash"):
