@@ -26,6 +26,12 @@ A goal survives interruption and continues through:
 
 **Gate:** demonstrate multi-step continuation and restart from durable state, bounded replanning, truthful completion/blocking, provider-failure recovery, and owner intervention through the production path.
 
+**Current evidence:** the production runtime now provides bounded one-step and multi-step entry
+points, durable action fingerprints and blockers, restart continuation, dynamic twin escalation,
+negative-outcome replanning, and outcome-gated completion. These claims remain scoped to the
+deterministic production-path tests; live external providers and Windows startup require manual
+verification.
+
 ## M2 — Verified Experience / Real Memory
 
 Replace primitive relevance storage with durable structured experience containing provenance, prediction, evidence, outcome, prediction error, usefulness, and competence. A/B retain distinct developmental memory.

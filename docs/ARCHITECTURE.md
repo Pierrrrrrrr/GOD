@@ -22,7 +22,28 @@ The permanent owner monetary budget defaults to exactly zero. Routing eligibilit
 both input and output prices to be explicitly zero; positive pricing is `PAID — BLOCKED` and
 missing or ambiguous pricing is `COST UNKNOWN — BLOCKED`. Exhaustion or failure may fall over
 only to another eligible zero-cost record, otherwise the result is
-`NO_FREE_INTELLIGENCE_AVAILABLE`. Account credit is not spending authorization.
+`NO_FREE_SAFE_INTELLIGENCE_AVAILABLE`. Account credit is not spending authorization.
+
+Model health is durable but bounded: transient failures enter an exponential cooldown and can
+recover; authentication or permission failures remain blocked until reconfiguration. The
+Intelligence Doctor uses synthetic text only and reports cost, privacy, response-mode support,
+latency, cooldown, and safe failure classifications. OpenRouter calls require ZDR, deny data
+collection, and require requested parameters. The central outbound policy permits only owner
+text, public evidence, and compact operational metadata automatically; constitutional/private
+sister data is never exportable and workspace-private disclosure requires an artifact-specific
+owner approval.
+
+### Durable autonomous goal engine
+
+The production runtime exposes one-step `advance_goal(goal_id)` and bounded
+`run_goal(goal_id, max_steps)`. A durable compact GoalBrief carries the stable owner objective,
+safe evidence references and hashes, blocker class, step count, attempted-action fingerprints,
+and whether twin escalation is required. Each advance plans at most one bounded stage, invokes
+the existing BodyBus/observation boundary, persists before returning, and never repeats an
+already recorded action fingerprint after restart. Uncertainty, risk, stagnation, negative
+outcomes, and ambiguous completion trigger metacognition and independent twin recruitment.
+Only an owner/evaluator-verified downstream outcome can complete a goal or update trusted
+competence; provider or transport success alone cannot.
 
 ### Root and authority
 

@@ -53,7 +53,7 @@ class RecordingPolicy(AssemblyFormationPolicy):
 def runtime(path: Path, policy=None) -> GodRuntime:
     policy = policy or AssemblyFormationPolicy()
     return GodRuntime(path, {"alpha": ScriptedOrgan("A"), "beta": ScriptedOrgan("B")},
-                      [ModelRecord("alpha", "one", input_cost=0, output_cost=0), ModelRecord("beta", "two", input_cost=0, output_cost=0)],
+                      [ModelRecord("alpha", "one", input_cost=0, output_cost=0, corporate_safe=True), ModelRecord("beta", "two", input_cost=0, output_cost=0, corporate_safe=True)],
                       formation_policy=policy, secret="awakening-test-key")
 
 
@@ -77,13 +77,12 @@ def test_full_awakening_audit_learning_and_restart(tmp_path: Path) -> None:
     expected_a_interpretation = episode2["interpretations"]["Saphira-A"]["argument"]
     assert first.organism.colonies["Saphira-A"].id != first.organism.colonies["Saphira-B"].id
     assert set(episode2["interpretations"]) == {"Saphira-A", "Saphira-B"}
-    assert policy.calls == 2 and learned_specializations > 0
-    # Compare task 2 with an inexperienced organism: the history, not just task wording,
-    # changes the state-sensitive colony/assembly decision.
+    assert policy.calls == 2 and learned_specializations == 0
+    # Unverified model traffic must not alter later competence-based assignment.
     control = runtime(tmp_path / "control")
     control_episode = control.submit_goal("Find a realistic way to reduce water waste again")
     assignment = lambda e: [(a["colony"], a["purpose"]) for a in e["assemblies"]]
-    assert assignment(episode2) != assignment(control_episode)
+    assert assignment(episode2) == assignment(control_episode)
     control.close()
     assert any(r.successes for r in first.records.values())
     assert all(not r.task_performance and r.calibration == .5 and r.quality_observations == 0
@@ -157,7 +156,7 @@ class SameProviderOrgan:
 def test_same_provider_routes_actual_models_and_cosmetic_difference_skips_audit(tmp_path: Path) -> None:
     organ = SameProviderOrgan(cosmetic=True)
     organism = GodRuntime(tmp_path, {"shared": organ},
-                          [ModelRecord("shared", "model-one", input_cost=0, output_cost=0), ModelRecord("shared", "model-two", input_cost=0, output_cost=0)],
+                          [ModelRecord("shared", "model-one", input_cost=0, output_cost=0, corporate_safe=True), ModelRecord("shared", "model-two", input_cost=0, output_cost=0, corporate_safe=True)],
                           secret="test-key")
     episode = organism.submit_goal("Find a realistic way to compare harmless wording")
     assert set(organ.model_ids) == {"model-one", "model-two"}
@@ -171,12 +170,13 @@ def test_same_provider_routes_actual_models_and_cosmetic_difference_skips_audit(
 class ProbeProvider:
     valid = True
 
-    def __init__(self, endpoint: str, key: str, *, gemini: bool = False):
+    def __init__(self, endpoint: str, key: str, *, gemini: bool = False, **_kwargs):
         self.key = key
 
     def infer(self, request: dict) -> dict:
         if not self.valid: raise RuntimeError("safe failure")
-        if "Capability probe" in request["prompt"]: return {"probe": True}
+        if "capability probe" in request["prompt"].lower():
+            return "OK" if request.get("response_mode") == "text" else {"probe": True}
         return "persist me" if request.get("response_mode") == "text" else {"answer": "persist me"}
 
     def catalog(self) -> list[dict]:
@@ -196,9 +196,9 @@ def test_connection_probe_metadata_and_visible_chat_restart(tmp_path: Path,
     assert "Saphira-A INITIALIZED" in failed.status() and "Root AUDIT VERIFIED" in failed.status()
     assert "Intelligence DISCONNECTED" in failed.status()
     assert failed.runtime.organism.memory is not None
-    with pytest.raises(ProviderUnavailable, match="NO_FREE_INTELLIGENCE_AVAILABLE"):
+    with pytest.raises(ProviderUnavailable, match="NO_FREE_SAFE_INTELLIGENCE_AVAILABLE"):
         failed.runtime.submit_goal("reason without an organ")
-    with pytest.raises(ProviderUnavailable, match="NO_FREE_INTELLIGENCE_AVAILABLE"):
+    with pytest.raises(ProviderUnavailable, match="NO_FREE_SAFE_INTELLIGENCE_AVAILABLE"):
         failed.chat("try to reason")
     assert not failed.runtime.store.rows("SELECT * FROM episodes")
     with pytest.raises(RuntimeError): failed.connect(values)
@@ -220,7 +220,7 @@ def test_connection_probe_metadata_and_visible_chat_restart(tmp_path: Path,
     assert "Saphira-A INITIALIZED" in restored.status() and "Root AUDIT VERIFIED" in restored.status()
     assert "Intelligence DISCONNECTED" in restored.status()
     assert "Pier: hello" in restored.transcript and "G.O.D.: persist me" in restored.transcript
-    with pytest.raises(ProviderUnavailable, match="NO_FREE_INTELLIGENCE_AVAILABLE"):
+    with pytest.raises(ProviderUnavailable, match="NO_FREE_SAFE_INTELLIGENCE_AVAILABLE"):
         restored.runtime.submit_goal("still cannot reason")
 
     ProbeProvider.valid = True
@@ -233,7 +233,7 @@ def test_connection_probe_metadata_and_visible_chat_restart(tmp_path: Path,
 def test_verified_quality_requires_explicit_outcome() -> None:
     from tmco.models import ModelRouter
 
-    record = ModelRecord("provider", "model", input_cost=0, output_cost=0)
+    record = ModelRecord("provider", "model", input_cost=0, output_cost=0, corporate_safe=True)
     ModelRouter.observe_call(record, True, 12)
     assert record.successes == 1 and record.availability
     assert record.task_performance == {} and record.calibration == .5

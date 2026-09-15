@@ -10,6 +10,7 @@ import time
 import webbrowser
 import queue
 import secrets
+import socket
 from collections import deque
 from uuid import uuid4
 from http.server import BaseHTTPRequestHandler, HTTPServer
@@ -19,35 +20,22 @@ from urllib.parse import parse_qs, urlsplit
 from .awakening import GodRuntime
 from .connectors import (GeminiConnector, OllamaConnector, OpenAICompatibleConnector,
                          OpenRouterConnector, ProviderConnector)
-from .models import HTTPModelProvider, ModelRecord, ModelRouter
+from .models import HTTPModelProvider, ModelRecord, ModelRouter, ResponseMode
 from .vault import CredentialHandle, CredentialVault
 
 PROVIDER_STATES = {"CONNECTED", "INVALID_CREDENTIAL", "UNAVAILABLE", "RECONNECT_REQUIRED", "NOT_CONFIGURED"}
 
 
-PAGE = """<!doctype html><html><head><meta charset=utf-8><meta name=csrf-token content="{csrf}"><title>G.O.D. Observatory</title>
-<style>:root{color-scheme:dark}body{font:14px system-ui;margin:0;background:#0b0f17;color:#e8edf8}header{display:flex;gap:1.3rem;padding:1rem 2rem;background:#141b28;border-bottom:1px solid #33415c;position:sticky;top:0}.ok{color:#75e0a7}.off{color:#ffbc70}.grid{display:grid;grid-template-columns:1fr 2fr 1.25fr;gap:1rem;padding:1rem}.panel,fieldset{background:#121925;border:1px solid #2c3952;border-radius:8px;padding:1rem}input,select,button{padding:.65rem;margin:.25rem;background:#202b3e;color:#fff;border:1px solid #526582;border-radius:4px}input[name=message]{width:70%}#chat{white-space:pre-wrap;min-height:20rem}.timeline{max-height:65vh;overflow:auto}.event{border-left:2px solid #709cf5;padding:.35rem .65rem;margin:.5rem 0}.offline{text-align:center;border-color:#b27a3e}.offline h2{letter-spacing:.12em}.summary{margin:.6rem 0;padding:.6rem;background:#192234}a{color:#8fb5ff}@media(max-width:900px){.grid{grid-template-columns:1fr}}</style></head>
-<body><header><b>CORPORATE_SAFE</b> · {header}</header><main>{onboarding}<div class=grid><section class=panel><h2>Current task</h2><div id=task>{status}</div><div id=approval-live>{approval}</div></section>
-<section class=panel><h2>Owner conversation</h2><div id=chat>{chat}</div><form id=chat-form method=post action=/chat><input name=message autofocus placeholder="Find a realistic way to achieve X" required><button>Send</button></form><h3>Safe sister summaries</h3><div id=sisters>{sisters}</div></section>
-<aside class="panel timeline"><h2>Live activity</h2><div id=events>{timeline}</div></aside></div>
-<fieldset><legend>Intelligence controls</legend><form method=post action=/local><button>DETECT LOCAL MODELS</button></form>
-<form method=post action=/policy><label>Zero-cost routing <select name=policy><option>ZERO_COST</option><option value=LOCAL_FIRST>LOCAL FREE FIRST</option><option value=FREE_FIRST>ANY VERIFIED FREE</option></select></label><button>Apply</button></form>
-<details><summary>Advanced: secrets file and manual provider/model IDs</summary><form method=post action=/import><input name=path placeholder="secrets.json path" required><label><input type=checkbox name=delete value=yes>Delete source after secure import</label><button>IMPORT</button></form><form method=post action=/connect>
-<select name=provider><option>OpenRouter</option><option>Gemini</option></select>
-<input name=model placeholder="model id" required>
-<input type=password name=key placeholder="API key" autocomplete=off required><button>Connect manually</button></form></details></fieldset></main>
-<script nonce="{nonce}">
-const esc=x=>String(x??'none').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
-const csrf=document.querySelector('meta[name=csrf-token]').content;
-async function poll(){const r=await fetch('/api/status',{cache:'no-store'});if(!r.ok)return;const s=await r.json();
-document.querySelector('#events').innerHTML=s.timeline.slice().reverse().map(e=>`<div class=event><b>${esc(e.kind)}</b><br>${esc(e.summary)}</div>`).join('');
-document.querySelector('#task').innerHTML=['job: '+esc(s.job?.state),'goal: '+esc(s.goal?.description),'step: '+esc(s.goal?.current_step),'work class: '+esc(s.goal?.work_class),'selected colony: '+esc(s.goal?.selected_colony),'selected model: '+esc(s.selection&&s.selection.provider+':'+s.selection.model_id),'intelligence resource: '+esc(s.selection?.cost_classification||'NO FREE INTELLIGENCE AVAILABLE'),'routing reason: '+esc(s.selection?.routing_reason),'organ: '+esc(s.goal?.current_organ),'verification: '+esc(s.verification),'pending approval: '+esc(s.pending_approval?.id),'capability gap: '+esc(s.capability_gap?.reason)].join('<br>');
-document.querySelector('#sisters').innerHTML=Object.entries(s.sisters).map(([n,v])=>`<div class=summary><b>${esc(n)}</b><br>${esc(v?.status)} · ${esc(v?.summary)} · confidence ${esc(v?.confidence)}</div>`).join('');
-document.querySelector('#approval-live').innerHTML=s.pending_approval?`<fieldset><legend>Pending approval</legend><p>${esc(s.pending_approval.reason)} · ${esc(s.pending_approval.organ)}.${esc(s.pending_approval.operation)}</p><button onclick="decideApproval('${esc(s.pending_approval.id)}',true)">APPROVE</button><button onclick="decideApproval('${esc(s.pending_approval.id)}',false)">DENY</button></fieldset>`:'';
-document.querySelector('#chat').textContent=s.conversation.map(x=>(x.role==='user'?'Pier: ':'G.O.D.: ')+x.content).join('\n');}
-async function decideApproval(id,approved){await fetch(approved?'/approve':'/deny',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded','X-GOD-CSRF':csrf},body:new URLSearchParams({id})});poll()}
-document.querySelectorAll('form').forEach(f=>f.addEventListener('submit',async e=>{e.preventDefault();const r=await fetch(f.action,{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded','X-GOD-CSRF':csrf},body:new URLSearchParams(new FormData(f))});if(f.id==='chat-form'){f.reset();poll()}else if(r.ok)location.reload()}));setInterval(poll,750);
-</script></body></html>"""
+PAGE = """<!doctype html><html lang=en><head><meta charset=utf-8><meta name=viewport content="width=device-width,initial-scale=1"><meta name=csrf-token content="{csrf}"><title>G.O.D.</title>
+<style>:root{color-scheme:dark;--bg:#071019;--card:#101c28;--line:#26394b;--text:#eaf2fa;--muted:#9eb0c2;--blue:#6eb6ff;--green:#6ce2ad;--amber:#ffc46b}*{box-sizing:border-box}body{margin:0;background:radial-gradient(circle at 50% -20%,#17324a,var(--bg) 45%);color:var(--text);font:15px system-ui,sans-serif}button,input,select{font:inherit}button,input,select{border:1px solid var(--line);border-radius:10px;background:#132536;color:var(--text);padding:.75rem}button{cursor:pointer}button:focus-visible,input:focus-visible,summary:focus-visible{outline:3px solid var(--blue);outline-offset:2px}button:disabled{opacity:.55;cursor:wait}.top{position:sticky;top:0;z-index:2;display:flex;gap:1rem;align-items:center;justify-content:space-between;padding:.75rem 1.25rem;background:#08131ded;border-bottom:1px solid var(--line);backdrop-filter:blur(12px)}.brand{font-weight:800;letter-spacing:.12em}.safe{color:var(--green);font-size:.8rem}.shell{max-width:1400px;margin:auto;display:grid;grid-template-columns:minmax(0,1fr) 340px;gap:1rem;padding:1rem}.card{background:var(--card);border:1px solid var(--line);border-radius:16px;padding:1rem;box-shadow:0 12px 40px #0004}.conversation{min-height:72vh;display:flex;flex-direction:column}.messages{flex:1;overflow:auto;min-height:420px;padding:.5rem}.empty{color:var(--muted);text-align:center;margin:auto}.bubble{max-width:78%;padding:.8rem 1rem;border-radius:14px;margin:.65rem 0;white-space:pre-wrap}.user{margin-left:auto;background:#1d5682}.assistant{background:#182b3b}.composer{display:flex;gap:.6rem;border-top:1px solid var(--line);padding-top:1rem}.composer input{flex:1}.job{min-height:1.5rem;color:var(--amber);font-size:.9rem}.side{display:flex;flex-direction:column;gap:1rem}h2,h3{margin:.2rem 0 .8rem}dl{display:grid;grid-template-columns:auto 1fr;gap:.35rem .8rem;margin:0}dt{color:var(--muted)}details summary{cursor:pointer;font-weight:700}.sister{padding:.7rem;border-left:3px solid var(--blue);margin:.6rem 0}.timeline{max-height:280px;overflow:auto}.event{padding:.55rem 0;border-bottom:1px solid var(--line)}.doctor-row{padding:.6rem 0;border-bottom:1px solid var(--line)}.controls form{display:flex;flex-wrap:wrap;gap:.4rem;margin:.5rem 0}.controls input{min-width:0;flex:1}.sr{position:absolute;left:-9999px}@media(max-width:900px){.shell{grid-template-columns:1fr}.conversation{min-height:62vh}.top{align-items:flex-start;flex-direction:column}.bubble{max-width:92%}}</style></head>
+<body><header class=top><div><span class=brand>G.O.D.</span> <span class=safe>CORPORATE_SAFE · ZERO COST</span></div><div aria-label="Runtime health">{header}</div></header>
+<main class=shell><section class="card conversation" aria-labelledby=conversation-title><h2 id=conversation-title>Conversation</h2><div id=job class=job role=status aria-live=polite>Ready</div><div id=chat class=messages>{chat}</div><form id=chat-form class=composer method=post action=/chat><label class=sr for=message>Message</label><input id=message name=message maxlength=8000 autocomplete=off placeholder="Message G.O.D." required><button id=send type=submit>Send</button></form></section>
+<aside class=side><section class=card><h3>Autonomous goal</h3><div id=task>{status}</div><form method=post action=/advance><input type=hidden name=steps value=1><button>Advance one safe step</button></form><div id=approval-live>{approval}</div></section><section class=card><h3>Intelligence & privacy</h3><div id=resource>No free intelligence selected.</div><details><summary>Intelligence Doctor & settings</summary><div id=doctor>Run a synthetic, non-sensitive probe to inspect intelligence.</div><button id=doctor-run type=button>Find working free intelligence</button><div class=controls>{onboarding}<form method=post action=/local><button>Detect local models</button></form><form method=post action=/policy><select name=policy aria-label="Zero-cost routing"><option>ZERO_COST</option><option value=LOCAL_FIRST>LOCAL FREE FIRST</option><option value=FREE_FIRST>ANY VERIFIED FREE</option></select><button>Apply</button></form></div></details></section>
+<section class=card><details><summary>Saphira observatory</summary><div id=sisters>{sisters}</div></details></section><section class=card><details open><summary>Development & capabilities</summary><div id=development>No persisted development activity.</div><div id=events class=timeline>{timeline}</div></details></section></aside></main>
+<script nonce="{nonce}">const esc=x=>String(x??'none').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));const csrf=document.querySelector('meta[name=csrf-token]').content;let activeJob=null;let pendingText=null;const chat=document.querySelector('#chat'),send=document.querySelector('#send'),input=document.querySelector('#message'),job=document.querySelector('#job');
+function renderConversation(items){chat.innerHTML=items.length?items.map(x=>`<div class="bubble ${x.role==='user'?'user':'assistant'}">${esc(x.content)}</div>`).join(''):'<div class=empty>No messages yet. Start a conversation or launch a goal.</div>';if(pendingText&&!items.some(x=>x.role==='user'&&x.content===pendingText))chat.innerHTML+=`<div class="bubble user">${esc(pendingText)}</div>`;chat.scrollTop=chat.scrollHeight}
+async function poll(){const q=activeJob?'?job_id='+encodeURIComponent(activeJob):'';const r=await fetch('/api/status'+q,{cache:'no-store'});if(!r.ok)return;const s=await r.json();renderConversation(s.conversation||[]);document.querySelector('#events').innerHTML=(s.timeline||[]).slice().reverse().map(e=>`<div class=event><b>${esc(e.kind)}</b><br>${esc(e.summary)}</div>`).join('')||'<div class=empty>No persisted activity.</div>';document.querySelector('#sisters').innerHTML=Object.entries(s.sisters||{}).map(([n,v])=>`<div class=sister><b>${esc(n)}</b><br>${esc(v?.status)} · ${esc(v?.summary)} · confidence ${esc(v?.confidence)}</div>`).join('');const cls=s.selection?.cost_classification||'NO FREE SAFE INTELLIGENCE AVAILABLE';document.querySelector('#resource').innerHTML=`<b>${esc(cls)}</b><br>${esc(s.selection?s.selection.provider+':'+s.selection.model_id:'No model selected')}<br>Privacy: ${esc(s.selection?.provider==='ollama'?'local':'corporate-safe remote only')}`;document.querySelector('#development').textContent=s.capability_gap?'Capability gap: '+(s.capability_gap.reason||'persisted gap'):(s.goal?.current_organ?'Current organ: '+s.goal.current_organ:'No active capability development.');if(s.job){job.textContent=s.job.state+(s.job.error?' — '+s.job.error:'');if(['COMPLETE','FAILED','WAITING_FOR_APPROVAL'].includes(s.job.state)){activeJob=null;pendingText=null;send.disabled=false;input.disabled=false;input.focus()}}}
+async function mutate(url,data){return fetch(url,{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded','X-GOD-CSRF':csrf},body:new URLSearchParams(data)})}document.querySelector('#chat-form').addEventListener('submit',async e=>{e.preventDefault();if(activeJob)return;pendingText=input.value;chat.querySelector('.empty')?.remove();chat.insertAdjacentHTML('beforeend',`<div class="bubble user">${esc(pendingText)}</div>`);chat.scrollTop=chat.scrollHeight;send.disabled=true;input.disabled=true;job.textContent='QUEUED';const r=await mutate('/chat',{message:pendingText});if(r.ok){const data=await r.json();activeJob=data.job_id;input.value='';job.textContent='QUEUED';poll()}else{job.textContent='Request rejected safely';activeJob=null;send.disabled=false;input.disabled=false}});document.querySelector('#doctor-run').addEventListener('click',async()=>{const b=document.querySelector('#doctor-run');b.disabled=true;const r=await mutate('/doctor',{synthetic:'true'});const data=await r.json();document.querySelector('#doctor').innerHTML=data.models.map(m=>`<div class=doctor-row><b>${esc(m.provider+':'+m.model)}</b><br>${esc(m.cost_classification)} · ${esc(m.health)} · ${esc(m.location)}<br>TEXT ${esc(m.text)} · STRUCTURED ${esc(m.structured)} · ${esc(m.failure_class||'no failure')}</div>`).join('')||'<div class=empty>NO FREE SAFE INTELLIGENCE AVAILABLE</div>';b.disabled=false;poll()});document.querySelectorAll('form:not(#chat-form)').forEach(f=>f.addEventListener('submit',async e=>{e.preventDefault();const r=await mutate(f.action,new FormData(f));if(r.ok)location.reload()}));setInterval(poll,600);poll();</script></body></html>"""
 
 
 class App:
@@ -94,7 +82,7 @@ class App:
         records = connector.discover()
         if not records:
             return 0
-        eligible = [record for record in records if record.zero_cost_eligible]
+        eligible = [record for record in records if record.zero_cost_eligible and (record.privacy == "local" or record.corporate_safe)]
         self.discovered.update((record.key, record) for record in records)
         if not eligible:
             return 0
@@ -104,9 +92,10 @@ class App:
         self.provider_states[connector.name] = "CONNECTED"
         return len(records)
 
-    def _apply_connectors(self) -> None:
+    def _apply_connectors(self, *, configuration_changed: bool = False) -> None:
         if self.connectors and self.discovered:
-            self.runtime.attach_intelligence(self.connectors, list(self.discovered.values()))
+            self.runtime.attach_intelligence(self.connectors, list(self.discovered.values()),
+                                             configuration_changed=configuration_changed)
 
     def import_secrets(self, path: str, delete_source: bool = False) -> int:
         handles = self.vault.import_file(Path(path), delete_source=delete_source)
@@ -116,7 +105,7 @@ class App:
             if connector is not None:
                 try: count += self._add_connector(connector)
                 except Exception: continue
-        self._apply_connectors()
+        self._apply_connectors(configuration_changed=True)
         return count
 
     def connect_openrouter(self, api_key: str) -> int:
@@ -125,15 +114,15 @@ class App:
         if not records:
             raise RuntimeError("provider catalog is unavailable")
         self.discovered.update((record.key, record) for record in records)
-        eligible = [record for record in records if record.zero_cost_eligible]
+        eligible = [record for record in records if record.zero_cost_eligible and (record.privacy == "local" or record.corporate_safe)]
         if not eligible:
-            raise RuntimeError("NO_FREE_INTELLIGENCE_AVAILABLE")
+            raise RuntimeError("NO_FREE_SAFE_INTELLIGENCE_AVAILABLE")
         preferred = eligible[0]
         connector.probe(preferred.model_id)
         self.vault.set_provider("openrouter", api_key)
         self.connectors[connector.name] = connector
         self.discovered.update((record.key, record) for record in records)
-        self._apply_connectors()
+        self._apply_connectors(configuration_changed=True)
         return len(records)
 
     def connect_gemini(self, api_key: str) -> int:
@@ -141,14 +130,14 @@ class App:
         records = connector.discover()
         if not records: raise RuntimeError("provider catalog is unavailable")
         self.discovered.update((record.key, record) for record in records)
-        eligible = [record for record in records if record.zero_cost_eligible]
-        if not eligible: raise RuntimeError("NO_FREE_INTELLIGENCE_AVAILABLE")
+        eligible = [record for record in records if record.zero_cost_eligible and (record.privacy == "local" or record.corporate_safe)]
+        if not eligible: raise RuntimeError("NO_FREE_SAFE_INTELLIGENCE_AVAILABLE")
         connector.probe(eligible[0].model_id)
         self.vault.set_provider("gemini", api_key)
         self.connectors[connector.name] = connector
         self.provider_states["gemini"] = "CONNECTED"
         self.discovered.update((record.key, record) for record in records)
-        self._apply_connectors()
+        self._apply_connectors(configuration_changed=True)
         return len(records)
 
     def detect_local_models(self) -> int:
@@ -162,6 +151,45 @@ class App:
         self._apply_connectors()
         return len(records)
 
+    def intelligence_doctor(self, probe: bool = False) -> list[dict[str, object]]:
+        """Return compact health facts; optional probes contain synthetic text only."""
+        if probe:
+            try: self.detect_local_models()
+            except Exception: pass
+            for record in list(self.runtime.records.values()):
+                if not record.zero_cost_eligible or record.blocked or not record.retry_eligible():
+                    continue
+                connector = self.connectors.get(record.provider)
+                if connector is None: continue
+                started = time.monotonic()
+                record.last_synthetic_probe = time.time()
+                try:
+                    connector.probe(record.model_id)
+                    ModelRouter.observe_call(record, True, (time.monotonic() - started) * 1000)
+                except Exception as error:
+                    ModelRouter.observe_call(record, False, (time.monotonic() - started) * 1000,
+                                             getattr(error, "failure_class", None))
+            self.runtime._save_models()
+        records = {**self.discovered, **self.runtime.records}
+        try:
+            selected = self.runtime.router.choose(list(records.values()), "conversation",
+                                                  policy=self.runtime.routing_policy).key
+        except RuntimeError:
+            selected = None
+        return [{"provider": record.provider, "model": record.model_id,
+                 "location": "local" if record.privacy == "local" else "remote",
+                 "zero_cost": record.zero_cost_eligible,
+                 "cost_classification": record.cost_classification,
+                 "text": record.text_capability, "structured": record.structured_capability,
+                 "privacy": record.privacy, "health": record.health_state,
+                 "last_synthetic_probe": record.last_synthetic_probe,
+                 "latency_ms": round(record.latency_ms, 1),
+                 "failure_class": record.last_failure_class, "selected": record.key == selected}
+                for record in sorted(records.values(), key=lambda item: item.key)]
+
+    def find_working_free_intelligence(self) -> list[dict[str, object]]:
+        return self.intelligence_doctor(probe=True)
+
     def _connect(self, values: dict[str, str]) -> None:
         provider, model, key = values["provider"], values["model"], values["key"]
         if provider == "Gemini":
@@ -170,17 +198,20 @@ class App:
             name = "gemini"
         elif provider == "OpenRouter":
             endpoint = "https://openrouter.ai/api/v1/chat/completions"
-            organ = HTTPModelProvider(endpoint, key)
+            organ = HTTPModelProvider(endpoint, key, openrouter=True)
             name = "openrouter"
         else:
             raise ValueError("unsupported provider in CORPORATE_SAFE mode")
         record = ModelRecord(name, model)
+        record.corporate_safe = name == "openrouter"
         catalog = organ.catalog()
         metadata = next((item for item in catalog if item.get("id", item.get("name", "")).endswith(model)), None)
         if metadata:
             record.context_capability = metadata.get("context_length") or metadata.get("inputTokenLimit")
             record.modalities = metadata.get("architecture", {}).get("input_modalities", ["text"])
             record.tool_capability = "generateContent" in metadata.get("supportedGenerationMethods", [])
+            if name == "openrouter":
+                record.structured_capability = "response_format" in metadata.get("supported_parameters", [])
             pricing = metadata.get("pricing", {})
             record.input_cost = self._price(pricing.get("prompt"))
             record.output_cost = self._price(pricing.get("completion"))
@@ -188,12 +219,12 @@ class App:
         if not record.zero_cost_eligible:
             raise RuntimeError(record.cost_classification)
         started = time.monotonic()
-        probe = organ.infer({"model_id": model,
-                             "prompt": "Capability probe. Return only JSON: {\"probe\": true}"})
+        probe = organ.infer({"model_id": model, "response_mode": ResponseMode.TEXT.value,
+                             "prompt": "Synthetic capability probe. Reply with OK."})
         probe_latency = (time.monotonic() - started) * 1000
-        if not isinstance(probe, dict) or probe.get("probe") is not True:
+        if not isinstance(probe, str) or not probe.strip():
             raise RuntimeError("provider capability probe failed")
-        self.runtime.attach_intelligence({name: organ}, [record])
+        self.runtime.attach_intelligence({name: organ}, [record], configuration_changed=True)
         attached = self.runtime.records[record.key]
         ModelRouter.observe_call(attached, True, probe_latency)
         self.runtime._save_models()
@@ -293,6 +324,13 @@ class App:
     def decide_approval(self, request_id: str, approved: bool) -> None:
         self.runtime.decide_approval(request_id, approved)
 
+    def advance_current_goal(self, max_steps: int = 1) -> dict[str, object]:
+        rows = self.runtime.store.rows("SELECT id FROM goals ORDER BY rowid DESC LIMIT 1")
+        if not rows: raise ValueError("No goal has been launched.")
+        goal_id = str(rows[0]["id"])
+        return (self.runtime.advance_goal(goal_id) if max_steps == 1
+                else self.runtime.run_goal(goal_id, max_steps=max_steps))
+
     def close(self) -> None:
         self.runtime.close()
 
@@ -312,7 +350,7 @@ class RuntimeWorker:
             job_id, operation, arguments, reply = self.jobs.get()
             if operation == "stop":
                 self.app.close(); reply.put(None); return
-            with self.lock: self.states[job_id]["state"] = "RUNNING"
+            with self.lock: self.states[job_id]["state"] = "THINKING" if operation == "chat" else "RUNNING"
             try:
                 result = getattr(self.app, operation)(*arguments)
                 if operation == "chat":
@@ -330,8 +368,11 @@ class RuntimeWorker:
                                            if approved else "Approval denied; goal blocked."), approval_request_id=None)
                 reply.put((True, result))
             except Exception as error:
-                with self.lock: self.states[job_id].update(state="FAILED", error=type(error).__name__)
-                reply.put((False, type(error).__name__))
+                safe_error = ("NO_FREE_SAFE_INTELLIGENCE_AVAILABLE"
+                              if "NO_FREE_SAFE_INTELLIGENCE_AVAILABLE" in str(error)
+                              else "Request failed safely; review Intelligence Doctor.")
+                with self.lock: self.states[job_id].update(state="FAILED", error=safe_error)
+                reply.put((False, safe_error))
 
     def submit(self, operation: str, *arguments: object, _exposed: bool = True) -> tuple[str, queue.Queue]:
         identity, reply = uuid4().hex, queue.Queue(maxsize=1)
@@ -499,6 +540,16 @@ def serve(data: Path, port: int, *, open_browser: bool = True) -> None:
                     body = json.dumps({"job_id": job_id, "status": "QUEUED"}).encode()
                     self.send_response(202); self._security_headers(); self.send_header("Content-Type", "application/json")
                     self.send_header("Content-Length", str(len(body))); self.end_headers(); self.wfile.write(body); return
+                if self.path == "/doctor":
+                    models = worker.call("find_working_free_intelligence")
+                    body = json.dumps({"models": models}).encode()
+                    self.send_response(200); self._security_headers(); self.send_header("Content-Type", "application/json")
+                    self.send_header("Content-Length", str(len(body))); self.end_headers(); self.wfile.write(body); return
+                if self.path == "/advance":
+                    result = worker.call("advance_current_goal", max(1, min(int(fields.get("steps", "1")), 10)))
+                    body = json.dumps({"status": result.get("status"), "step": result.get("step_count")}).encode()
+                    self.send_response(200); self._security_headers(); self.send_header("Content-Type", "application/json")
+                    self.send_header("Content-Length", str(len(body))); self.end_headers(); self.wfile.write(body); return
                 if self.path == "/connect": response = worker.call("connect", fields)
                 elif self.path == "/import":
                     count = worker.call("import_secrets", fields.get("path", ""), fields.get("delete") == "yes")
@@ -539,10 +590,46 @@ def serve(data: Path, port: int, *, open_browser: bool = True) -> None:
     finally: server.server_close(); worker.close()
 
 
+def startup_doctor(data: Path) -> dict[str, object]:
+    """Headless, redacted startup diagnostic; performs no installation or mutation outside data."""
+    checks: dict[str, object] = {}
+    data.mkdir(parents=True, exist_ok=True)
+    checks["data_directory"] = "writable" if data.is_dir() else "unavailable"
+    app: App | None = None
+    try:
+        app = App(data)
+        checks["root_audit"] = "verified" if app.runtime.organism.root.verify_audit() else "fault"
+        checks["vault"] = "available"
+        checks["workspace_confinement"] = str((data / "workspace").resolve()).startswith(str(data.resolve()))
+        with sqlite3.connect(data / "awakening.sqlite3") as database:
+            checks["database_recovery"] = database.execute("PRAGMA quick_check").fetchone()[0]
+        checks["models"] = app.find_working_free_intelligence()
+    except Exception as error:
+        checks["startup"] = "failed"
+        checks["safe_failure_class"] = type(error).__name__
+    finally:
+        if app is not None: app.close()
+    probe = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    try:
+        probe.bind(("127.0.0.1", 0)); checks["loopback"] = "available"
+    except OSError:
+        checks["loopback"] = "unavailable"
+    finally: probe.close()
+    checks["ok"] = not any(isinstance(value, str) and value in {"fault", "failed", "unavailable"}
+                           for value in checks.values())
+    return checks
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(); parser.add_argument("--data", type=Path, default=Path.home() / ".god")
     parser.add_argument("--port", type=int, default=8765); parser.add_argument("--no-browser", action="store_true")
-    args = parser.parse_args(); serve(args.data, args.port, open_browser=not args.no_browser)
+    parser.add_argument("--doctor", action="store_true")
+    args = parser.parse_args()
+    if args.doctor:
+        report = startup_doctor(args.data)
+        print(json.dumps(report, indent=2, sort_keys=True))
+        raise SystemExit(0 if report.get("ok") else 1)
+    serve(args.data, args.port, open_browser=not args.no_browser)
 
 
 if __name__ == "__main__": main()

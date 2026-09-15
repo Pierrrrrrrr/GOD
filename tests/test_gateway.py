@@ -18,7 +18,7 @@ class GatewayConnector:
         self.instances.append(self)
 
     def discover(self) -> list[ModelRecord]:
-        return [ModelRecord(self.name, "openrouter/free", input_cost=0, output_cost=0),
+        return [ModelRecord(self.name, "openrouter/free", input_cost=0, output_cost=0, corporate_safe=True),
                 ModelRecord(self.name, "paid-model", input_cost=.1, output_cost=.2)]
 
     def probe(self, model_id: str) -> None:
@@ -76,7 +76,7 @@ def test_openrouter_catalog_keeps_only_concrete_catalog_models(monkeypatch: pyte
     monkeypatch.setattr(connector.transport, "catalog", lambda: [{
         "id": "community/free-model", "context_length": 4096,
         "architecture": {"input_modalities": ["text"]},
-        "supported_parameters": ["tools"],
+        "supported_parameters": ["tools", "response_format"],
         "pricing": {"prompt": "0", "completion": "0"},
     }])
     records = connector.discover()
@@ -84,6 +84,7 @@ def test_openrouter_catalog_keeps_only_concrete_catalog_models(monkeypatch: pyte
     assert discovered["community/free-model"].input_cost == 0
     assert discovered["community/free-model"].context_capability == 4096
     assert discovered["community/free-model"].tool_capability
+    assert discovered["community/free-model"].structured_capability
     assert "openrouter/free" not in discovered
 
 
