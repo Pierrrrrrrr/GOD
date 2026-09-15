@@ -51,6 +51,7 @@ class RecordingPolicy(AssemblyFormationPolicy):
 
 
 def runtime(path: Path, policy=None) -> GodRuntime:
+    policy = policy or AssemblyFormationPolicy()
     return GodRuntime(path, {"alpha": ScriptedOrgan("A"), "beta": ScriptedOrgan("B")},
                       [ModelRecord("alpha", "one"), ModelRecord("beta", "two")],
                       formation_policy=policy, secret="awakening-test-key")

@@ -17,6 +17,7 @@ from .embodiment import (ActionLoop, CapabilityDemand, CapabilityResolver, Embod
                          VerificationLevel, WebResearchOrgan,
                          WorkspaceFilesystemOrgan)
 from .executive import Cognition
+from .development import DevelopmentCandidate, DevelopmentEngine
 from .models import ModelRecord, ModelRouter
 from .morphogenesis import AssemblyFormationPolicy
 from .system import TMCOSystem
@@ -157,7 +158,9 @@ class GodRuntime:
         self.records: dict[str, ModelRecord] = {}
         self.routing_policy = "AUTO"
         self.cognition: Cognition = DisconnectedCognition()
-        self.policy = formation_policy or AssemblyFormationPolicy()
+        # DigitalNeuron formation remains an opt-in legacy experiment. Live body
+        # capability resolution and development do not depend on it.
+        self.policy = formation_policy
         # Existing Phase 1 state format remains the authority for organism identity/neural state.
         self.organism = TMCOSystem(directory / "organism", self.cognition, secret=secret,
                                    formation_policy=self.policy)
@@ -174,6 +177,9 @@ class GodRuntime:
         self.sister_exchange = SisterExchangePolicy()
         self._restore_exchange_rounds()
         self._register_builtin_organs(web_test_allow_hosts)
+        self.development = DevelopmentEngine(self.body_bus, self.embodiment_store,
+                                             self.organ_registry, self._development_event)
+        self.development.restore()
         self._event("BOOT", "Root and both sister lineages restored")
         for name in ("Saphira-A", "Saphira-B"):
             if not self.store.rows("SELECT 1 FROM sister_states WHERE colony=? LIMIT 1", (name,)):
@@ -202,6 +208,16 @@ class GodRuntime:
                      "VERIFICATION_CHANGED": "Observation verification changed",
                      "FAILED": "Body invocation failed"}
         self._event(kind, summaries[kind], state)
+
+    def _development_event(self, kind: str, state: dict[str, Any]) -> None:
+        self._event(kind, kind.replace("_", " ").title(), state)
+
+    def develop_capability(self, demand: CapabilityDemand, proposals: dict[str, Any],
+                           evaluator: Any, auditor: Any) -> DevelopmentCandidate | None:
+        """Run the bounded developmental path, then leave normal resolution to the caller."""
+        if set(proposals) != {"Saphira-A", "Saphira-B"}:
+            raise ValueError("independent proposals from both sister lineages are required")
+        return self.development.develop(demand, proposals, evaluator, auditor)
 
     def _restore_exchange_rounds(self) -> None:
         for event in self.embodiment_store.all("exchange"):
@@ -293,8 +309,9 @@ class GodRuntime:
         goal = Goal(goal_id, text, ("credible evidence of progress",))
         work_class = classify_work(text)
         self._event("WORK_CLASS_SELECTED", f"Work classified as {work_class.value}", {"goal_id": goal_id})
-        decisions = self.policy.form(self.organism.colonies, goal,
-                                     {name: ComputeBudget(8) for name in self.organism.colonies})
+        decisions = (self.policy.form(self.organism.colonies, goal,
+                                      {name: ComputeBudget(8) for name in self.organism.colonies})
+                     if self.policy is not None else [])
         interpretations: dict[str, dict[str, Any]] = {}
         used: set[str] = set()
         colonies = (list(self.organism.colonies.items()) if work_class == WorkClass.DELIBERATIVE and important
@@ -442,6 +459,10 @@ class GodRuntime:
                     str(data["expected_evidence"]), float(data["confidence"]), float(data["goal_value"]),
                     float(data["information_gain"]), float(data["capability_gain"]), float(data["uncertainty"]))
                 neuron_ids = tuple(n for decision in decisions if decision.colony_name == source_colony for n in decision.neuron_ids)
+                # Outcome attribution remains compatible with the persisted Phase-1
+                # substrate without requiring heuristic assembly formation.
+                if not neuron_ids:
+                    neuron_ids = (next(iter(self.organism.colonies[source_colony].neurons)),)
                 assembly_ids = tuple(decision.assembly_id for decision in decisions if decision.colony_name == source_colony)
                 provenance = DecisionProvenance(uuid4().hex, goal_id, episode_id, source_colony,
                     view["model"], assembly_ids, neuron_ids, demand.id, time.time())
