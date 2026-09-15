@@ -4,13 +4,15 @@ from __future__ import annotations
 import json
 import sqlite3
 import time
-from dataclasses import asdict
+import hashlib
+import re
+from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
 from uuid import uuid4
 
 from .buses import BodyBus, ModelBus, ModelProvider, OrganManifest, ProviderUnavailable
-from .capabilities import OwnerCapabilityAuthority
+from .capabilities import OwnerCapability, OwnerCapabilityAuthority
 from .embodiment import (ActionLoop, CapabilityDemand, CapabilityResolver, EmbodimentStore,
                          DecisionProvenance, HumanApprovalRequest, ObservationEnvelope,
                          OrganRegistry, OutcomeEvaluation, OutcomeEvaluator, PermissionAuthority,
@@ -18,12 +20,24 @@ from .embodiment import (ActionLoop, CapabilityDemand, CapabilityResolver, Embod
                          WorkspaceFilesystemOrgan)
 from .executive import Cognition
 from .development import DevelopmentCandidate, DevelopmentEngine
-from .models import ModelRecord, ModelRouter
+from .data_policy import DataClass
+from .models import ExclusionMode, ModelRecord, ModelRouter, ResponseMode
 from .morphogenesis import AssemblyFormationPolicy
 from .system import TMCOSystem
 from .types import ActionCandidate, ComputeBudget, Goal, GoalStatus
 from .sisters import (BriefResponse, DigestResponse, SisterBrief, SisterDevelopmentDigest,
                       SisterExchangePolicy, SisterView, WorkClass, classify_work)
+
+
+@dataclass(frozen=True, slots=True)
+class GoalSuccessVerification:
+    goal_id: str
+    evaluator: str
+    success_criteria: tuple[str, ...]
+    evidence_refs: tuple[str, ...]
+    verified: bool
+    timestamp: float
+    reason: str
 
 
 class AwakeningStore:
@@ -47,6 +61,9 @@ class AwakeningStore:
         CREATE TABLE IF NOT EXISTS sister_states(
           sequence INTEGER PRIMARY KEY AUTOINCREMENT,colony TEXT,goal_id TEXT,status TEXT,
           summary TEXT,confidence REAL,created REAL);
+        CREATE TABLE IF NOT EXISTS goal_success_verifications(
+          id INTEGER PRIMARY KEY AUTOINCREMENT, goal_id TEXT NOT NULL,
+          state TEXT NOT NULL, created REAL NOT NULL);
         """)
         self.connection.commit()
 
@@ -100,6 +117,11 @@ class AwakeningStore:
         self.connection.execute("INSERT INTO sister_states(colony,goal_id,status,summary,confidence,created) VALUES(?,?,?,?,?,?)",
                                 (colony, goal_id, status, summary, confidence, time.time())); self.connection.commit()
 
+    def goal_verification(self, verification: GoalSuccessVerification) -> None:
+        self.connection.execute("INSERT INTO goal_success_verifications(goal_id,state,created) VALUES(?,?,?)",
+                                (verification.goal_id, json.dumps(asdict(verification)), verification.timestamp))
+        self.connection.commit()
+
 
 class ModelBackedCognition(Cognition):
     """Cognitive schema adapter. Identity and learning remain outside the model."""
@@ -110,9 +132,25 @@ class ModelBackedCognition(Cognition):
         result = self.bus.request(self.record.provider, {
             "model_id": self.record.model_id,
             "prompt": demand + "\nJSON context:\n" + json.dumps(context),
+            "response_mode": ResponseMode.STRUCTURED.value,
+            "data_classes": [DataClass.OWNER_TYPED.value, DataClass.OPERATIONAL_METADATA.value],
         })
         if not isinstance(result, dict):
             raise ValueError("model cognition must return a JSON object")
+        return result
+
+    def converse(self, message: str, context: dict[str, Any]) -> str:
+        """Send owner-authored text plus compact, non-private operational context."""
+        result = self.bus.request(self.record.provider, {
+            "model_id": self.record.model_id,
+            "prompt": "Reply naturally and truthfully. Do not invent activity.\n"
+                      + "Owner message:\n" + message + "\nOperational context:\n"
+                      + json.dumps(context),
+            "response_mode": ResponseMode.TEXT.value,
+            "data_classes": [DataClass.OWNER_TYPED.value, DataClass.OPERATIONAL_METADATA.value],
+        })
+        if not isinstance(result, str):
+            raise ValueError("conversation model must return text")
         return result
 
     def decompose(self, goal: Goal) -> list[str]:
@@ -156,7 +194,8 @@ class GodRuntime:
         self.bus = ModelBus(production=True)
         self.router = ModelRouter()
         self.records: dict[str, ModelRecord] = {}
-        self.routing_policy = "AUTO"
+        self.routing_policy = "ZERO_COST"
+        self.monetary_budget = 0
         self.cognition: Cognition = DisconnectedCognition()
         # DigitalNeuron formation remains an opt-in legacy experiment. Live body
         # capability resolution and development do not depend on it.
@@ -165,7 +204,10 @@ class GodRuntime:
         self.organism = TMCOSystem(directory / "organism", self.cognition, secret=secret,
                                    formation_policy=self.policy)
         self.store = AwakeningStore(directory / "awakening.sqlite3")
-        self.routing_policy = self.store.setting("routing_policy", "AUTO")
+        self.routing_policy = self.store.setting("routing_policy", "ZERO_COST")
+        if self.routing_policy == "AUTO":
+            self.routing_policy = "ZERO_COST"
+            self.store.set_setting("routing_policy", self.routing_policy)
         self.body_bus = BodyBus()
         self.embodiment_store = EmbodimentStore(directory / "embodiment.sqlite3")
         self.organ_registry = OrganRegistry(self.body_bus, self.embodiment_store)
@@ -174,6 +216,7 @@ class GodRuntime:
         self.permission_authority = PermissionAuthority(self.embodiment_store)
         self.owner_capabilities = OwnerCapabilityAuthority(self.organism.root,
                                                            directory / "owner_capabilities.sqlite3")
+        self.bus.outbound_policy.authority = self.owner_capabilities
         self.sister_exchange = SisterExchangePolicy()
         self._restore_exchange_rounds()
         self._register_builtin_organs(web_test_allow_hosts)
@@ -276,6 +319,7 @@ class GodRuntime:
                      "composite_organ_contract": contract,
                      "security": ["registered trusted operations only", "no recursion or cycles",
                                   "no Root, credentials, shell, code, privilege grants, or scope expansion"]})
+                development_records[lineage] = self.records[self._last_model_key]
                 proposal = response.get("composite_organ")
                 if not isinstance(proposal, dict): raise ValueError("model did not return a composite_organ object")
                 return proposal
@@ -298,18 +342,21 @@ class GodRuntime:
 
     @property
     def intelligence_connected(self) -> bool:
-        return bool(self.bus.providers and self.records)
+        return bool(self.bus.providers and any(record.availability and record.zero_cost_eligible
+                                               and (record.privacy == "local" or record.corporate_safe)
+                                               for record in self.records.values()))
 
     def set_routing_policy(self, policy: str) -> None:
-        if policy not in {"AUTO", "FREE_FIRST", "LOCAL_FIRST"}:
+        if policy not in {"ZERO_COST", "FREE_FIRST", "LOCAL_FIRST"}:
             raise ValueError("unknown routing policy")
         self.routing_policy = policy
         self.store.set_setting("routing_policy", policy)
         self._event("ROUTING", f"Routing policy changed to {policy}")
 
     def attach_intelligence(self, providers: dict[str, ModelProvider],
-                            records: list[ModelRecord]) -> None:
+                            records: list[ModelRecord], *, configuration_changed: bool = False) -> None:
         bus = ModelBus(providers, production=True)
+        bus.outbound_policy.authority = self.owner_capabilities
         configured = {record.key: record for record in records}
         if not configured:
             raise ProviderUnavailable("at least one model record is required")
@@ -319,8 +366,20 @@ class GodRuntime:
         # unavailability must not prevent this newly confirmed connection.
         for key, record in configured.items():
             self.records[key].availability = record.availability
-        initial = self.router.choose(list(self.records.values()), "conversation",
-                                     policy=self.routing_policy)
+            if configuration_changed:
+                self.records[key].blocked = False
+                self.records[key].consecutive_failures = 0
+                self.records[key].last_failure_class = None
+                self.records[key].cooldown_until = 0
+        try:
+            initial = self.router.choose(list(self.records.values()), "conversation",
+                                         policy=self.routing_policy)
+        except RuntimeError:
+            self.cognition = DisconnectedCognition()
+            self.organism.executive.cognition = self.cognition
+            self._save_models()
+            self._event("INTELLIGENCE", "NO_FREE_SAFE_INTELLIGENCE_AVAILABLE")
+            return
         self.cognition = ModelBackedCognition(self.bus, initial)
         self.organism.executive.cognition = self.cognition
         self._save_models()
@@ -328,6 +387,7 @@ class GodRuntime:
 
     def detach_intelligence(self) -> None:
         self.bus = ModelBus(production=True)
+        self.bus.outbound_policy.authority = self.owner_capabilities
         self.records = {}
         self.cognition = DisconnectedCognition()
         self.organism.executive.cognition = self.cognition
@@ -343,8 +403,8 @@ class GodRuntime:
             if record.key in self.records:
                 self.records[record.key] = record
 
-    def _model_call(self, record: ModelRecord, goal_id: str | None, episode_id: str | None,
-                    task: str, colony: str | None, demand: str, context: dict[str, Any]) -> dict[str, Any]:
+    def _model_attempt(self, record: ModelRecord, goal_id: str | None, episode_id: str | None,
+                       task: str, colony: str | None, demand: str, context: dict[str, Any]) -> dict[str, Any]:
         identity, started_wall, started = uuid4().hex, time.time(), time.monotonic()
         selection = {"id": identity, "goal_id": goal_id, "episode_id": episode_id,
                      "task_class": task, "colony": colony, "provider": record.provider,
@@ -352,19 +412,77 @@ class GodRuntime:
                      "routing_reason": self.router.reason(record, task, self.routing_policy),
                      "started_at": started_wall, "finished_at": None, "latency_ms": None,
                      "success": None}
-        self.store.model_selection(selection)
         self._event("MODEL_SELECTED", f"{record.key} selected for {task}",
                     {key: selection[key] for key in ("id", "goal_id", "episode_id", "task_class", "colony",
                                                      "provider", "model_id", "routing_policy", "routing_reason")})
+        self.store.model_selection(selection)
+        failure_class = None
         try:
             result = ModelBackedCognition(self.bus, record).ask(demand, context); success = True
             return result
-        except Exception:
-            success = False; raise
+        except Exception as error:
+            success = False
+            failure_class = getattr(error, "failure_class", None)
+            raise
         finally:
             latency = (time.monotonic() - started) * 1000
             selection.update(finished_at=time.time(), latency_ms=latency, success=int(success))
-            self.store.model_selection(selection); self.router.observe_call(record, success, latency)
+            self.store.model_selection(selection)
+            self.router.observe_call(record, success, latency, failure_class)
+
+    def _model_call(self, record: ModelRecord, goal_id: str | None, episode_id: str | None,
+                    task: str, colony: str | None, demand: str, context: dict[str, Any]) -> dict[str, Any]:
+        attempted: set[str] = set()
+        current = record
+        last_error: Exception | None = None
+        while len(attempted) < len(self.records):
+            attempted.add(current.key)
+            try:
+                result = self._model_attempt(current, goal_id, episode_id, task, colony, demand, context)
+                self._last_model_key = current.key
+                self._save_models()
+                return result
+            except Exception as error:
+                last_error = error
+                self._save_models()
+                self._event("MODEL_FAILOVER", f"{current.key} failed; seeking another safe free model",
+                            {"goal_id": goal_id, "task": task})
+                try:
+                    current = self.router.choose(list(self.records.values()), task, exclude=attempted,
+                                                 policy=self.routing_policy,
+                                                 exclusion_mode=ExclusionMode.STRICT_EXCLUSION)
+                except RuntimeError:
+                    break
+        raise ProviderUnavailable("NO_FREE_SAFE_INTELLIGENCE_AVAILABLE") from last_error
+
+    def _conversation_call(self, message: str, state: dict[str, Any] | None) -> str:
+        """Use TEXT mode with bounded failover and no private or workspace state."""
+        attempted: set[str] = set()
+        last_error: Exception | None = None
+        while len(attempted) < len(self.records):
+            try:
+                record = self.router.choose(list(self.records.values()), "conversation",
+                                            exclude=attempted, policy=self.routing_policy,
+                                            exclusion_mode=ExclusionMode.STRICT_EXCLUSION)
+            except RuntimeError:
+                break
+            attempted.add(record.key)
+            started = time.monotonic()
+            try:
+                compact = {key: state.get(key) for key in
+                           ("status", "current_step", "work_class") if state is not None}
+                answer = ModelBackedCognition(self.bus, record).converse(message, compact)
+                self.router.observe_call(record, True, (time.monotonic() - started) * 1000)
+                self._event("MODEL_RESPONSE", f"{record.key} returned conversation text")
+                self._save_models()
+                return answer
+            except Exception as error:
+                last_error = error
+                self.router.observe_call(record, False, (time.monotonic() - started) * 1000,
+                                         getattr(error, "failure_class", None))
+                self._event("MODEL_FAILOVER", f"{record.key} failed; trying another available model")
+        self._save_models()
+        raise ProviderUnavailable("NO_FREE_SAFE_INTELLIGENCE_AVAILABLE") from last_error
 
     def _sister_transition(self, colony: str, goal_id: str | None, status: str, summary: str) -> None:
         confidence = round(sum(n.confidence for n in self.organism.colonies[colony].neurons.values()) /
@@ -375,7 +493,7 @@ class GodRuntime:
         if not text.strip():
             raise ValueError("a natural-language goal is required")
         if not self.intelligence_connected:
-            raise ProviderUnavailable("external intelligence is disconnected")
+            raise ProviderUnavailable("NO_FREE_SAFE_INTELLIGENCE_AVAILABLE")
         goal_id, episode_id = uuid4().hex, uuid4().hex
         self._event("GOAL_ACCEPTED", "Owner goal accepted", {"goal_id": goal_id})
         goal = Goal(goal_id, text, ("credible evidence of progress",))
@@ -408,12 +526,12 @@ class GodRuntime:
                     "information_gain, capability_gain, uncertainty, network_need, and filesystem_need. Return an "
                     "empty body_demands list when no body capability is needed. Describe WHAT is required only; "
                     "never request shell or arbitrary code execution and never claim prose is an executed action.",
-                    {"colony": name, "identity": colony.id, "goal": text})
+                    {"colony": name, "goal": text})
             except Exception:
                 self._sister_transition(name, goal_id, "BLOCKED", "Model call failed")
                 self._event("FAILED", f"{name} model call failed", {"goal_id": goal_id, "colony": name})
                 self._save_models(); raise
-            interpretations[name] = {"model": record.key, "argument": answer}
+            interpretations[name] = {"model": self._last_model_key, "argument": answer}
             self._event("SISTER_RESULT_READY", f"{name} result ready", {"goal_id": goal_id, "colony": name})
             self._sister_transition(name, goal_id, "IDLE", "Independent result ready")
         candidate_disagreement = self._candidate_disagreement(interpretations)
@@ -448,12 +566,34 @@ class GodRuntime:
                    "audit": audit, "exchange": exchange, "work_class": work_class.value,
                    "assemblies": [{"colony": d.colony_name, "purpose": d.purpose.value,
                                                     "neurons": list(d.neuron_ids)} for d in decisions]}
+        primary_argument = next(iter(interpretations.values()))["argument"]
+        proposed_criteria = [str(item) for item in primary_argument.get("success_evidence", [])
+                             if isinstance(item, (str, int, float))]
+        stable_criteria = self._derive_success_criteria(text, proposed_criteria)
+        owner_terms = {word.casefold() for word in re.findall(r"[\w.-]{4,}", text)}
+        owner_constraints = tuple(dict.fromkeys(["monetary budget exactly zero", "CORPORATE_SAFE",
+            *(str(item) for item in primary_argument.get("constraints", [])
+              if isinstance(item, (str, int, float)) and owner_terms.intersection(
+                  word.casefold() for word in re.findall(r"[\w.-]{4,}", str(item))))]))
+        goal_frame = {"version": 1, "goal_id": goal_id, "owner_intent": text,
+            "desired_outcome": str(primary_argument.get("desired_outcome") or text),
+            "owner_constraints": list(owner_constraints), "success_criteria": list(stable_criteria),
+            "created_at": time.time(), "current_milestone": "reasoning", "blocker": None,
+            "verified_evidence_refs": [], "rejected_completion_claims": [],
+            "next_move": (audit or primary_argument).get("selected_next_action",
+                         primary_argument.get("next_useful_action")), "step_count": 1,
+            "monetary_budget": 0}
+        frame_digest = self._goal_frame_stable_digest(goal_frame)
         state = {"id": goal_id, "description": text, "status": GoalStatus.ACTIVE.value,
                  "next_action": (audit or next(iter(interpretations.values()))["argument"]).get(
                      "selected_next_action", next(iter(interpretations.values()))["argument"].get("next_useful_action")),
                  "episode_id": episode["id"], "work_class": work_class.value, "current_step": "reasoning",
                  "selected_colony": primary_colony,
-                 "current_organ": None, "last_observation": None, "exchange_status": "completed" if exchange else "none"}
+                 "current_organ": None, "last_observation": None, "exchange_status": "completed" if exchange else "none",
+                 "step_count": 1, "action_ledger": {}, "stagnation_count": 0,
+                 "blocker": None, "verified_evidence": [], "last_consumed_observation": None,
+                 "success_criteria": list(stable_criteria), "goal_frame": goal_frame,
+                 "goal_frame_digest": frame_digest}
         self.store.put("goals", goal_id, state)
         self.store.put("episodes", episode["id"], episode)
         self._learn_neurons(decisions, text)
@@ -467,6 +607,280 @@ class GodRuntime:
         if not demands or episode.get("body", {}).get("status") == "executed":
             self._event("FINAL_RESPONSE", "Synchronous goal response returned", {"goal_id": goal_id})
         return episode
+
+    def launch_goal(self, text: str) -> str:
+        """Production entry point returning the durable identity of a launched goal."""
+        return str(self.submit_goal(text, important=True)["goal_id"])
+
+    @staticmethod
+    def _blocker_for(state: dict[str, Any], body: dict[str, Any] | None = None) -> str | None:
+        if state.get("pending_approval"): return "PERMISSION"
+        if body and body.get("status") == "gap": return "CAPABILITY"
+        if body and body.get("status") == "failed": return "EXECUTION"
+        if state.get("stagnation_count", 0): return "STRATEGY"
+        return None
+
+    BLOCKER_CLASSES = {"INFORMATION", "CAPABILITY", "PERMISSION", "PROVIDER",
+                       "STRATEGY", "OBJECTIVE", "EXECUTION"}
+    ACTION_LEDGER_STATES = {"PROPOSED", "WAITING_APPROVAL", "EXECUTING", "OBSERVED",
+                            "VERIFIED", "FAILED", "RETRYABLE", "SUPERSEDED"}
+    GOAL_VERIFIERS = {"OWNER", "REGISTERED_VERIFIER", "OBJECTIVE_TEST"}
+
+    @staticmethod
+    def _derive_success_criteria(owner_intent: str, proposals: list[str]) -> tuple[str, ...]:
+        """Create an immutable, owner-traceable target without granting the model authority."""
+        criteria = [f"Owner intent satisfied exactly: {owner_intent}"]
+        file_match = re.search(r"\b([\w.-]+\.[A-Za-z0-9]{1,12})\b", owner_intent)
+        if file_match:
+            filename = file_match.group(1)
+            criteria.append(f"{filename} exists inside the approved workspace")
+            content_match = re.search(r"\bcontaining\s+(.+)$", owner_intent, re.IGNORECASE)
+            if content_match:
+                criteria.append(
+                    f"{filename} contains the owner-required content: {content_match.group(1).strip()}")
+            criteria.append(f"Verified artifact evidence and a content hash exist for {filename}")
+        source_match = re.search(r"\b(\d+|one|two|three|four|five)\s+verified\s+sources?\b",
+                                 owner_intent, re.IGNORECASE)
+        if source_match:
+            criteria.append(f"The result includes {source_match.group(1)} verified source references")
+        owner_terms = {word.casefold() for word in re.findall(r"[\w.-]{4,}", owner_intent)}
+        criteria.extend(item for item in proposals if owner_terms.intersection(
+            word.casefold() for word in re.findall(r"[\w.-]{4,}", item)))
+        return tuple(dict.fromkeys(criteria))
+
+    @staticmethod
+    def _goal_frame_stable_digest(frame: dict[str, Any]) -> str:
+        stable = {key: frame.get(key) for key in ("version", "goal_id", "owner_intent",
+            "desired_outcome", "owner_constraints", "success_criteria", "created_at")}
+        return hashlib.sha256(json.dumps(stable, sort_keys=True,
+                                         separators=(",", ":")).encode()).hexdigest()
+
+    def verify_goal_success(self, verification: GoalSuccessVerification,
+                            capability: OwnerCapability) -> bool:
+        rows = self.store.rows("SELECT state FROM goals WHERE id=?", (verification.goal_id,))
+        if not rows: raise KeyError("unknown goal")
+        state = json.loads(rows[0]["state"])
+        if self._goal_frame_stable_digest(state.get("goal_frame", {})) != state.get("goal_frame_digest"):
+            raise RuntimeError("stable GoalFrame integrity check failed")
+        if verification.evaluator not in self.GOAL_VERIFIERS:
+            raise PermissionError("untrusted goal verifier")
+        if tuple(state.get("success_criteria", ())) != verification.success_criteria:
+            raise ValueError("goal verification criteria do not match the stable goal")
+        if not verification.evidence_refs:
+            raise ValueError("goal verification requires evidence references")
+        request = capability.request
+        verification_digest = hashlib.sha256(json.dumps(
+            asdict(verification), sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+        if (request.service != "goal-verification" or request.operation != verification.evaluator
+                or request.account_id != verification.goal_id
+                or request.allowed_submitted_data != verification.evidence_refs
+                or request.workflow_id != verification_digest
+                or request.executor_principal != "goal-success-gate" or request.maximum_cost != 0):
+            raise PermissionError("goal verification capability scope mismatch")
+        self.owner_capabilities.start(capability, request, executor_principal="goal-success-gate")
+        self.store.goal_verification(verification)
+        self._event("GOAL_SUCCESS_VERIFIED" if verification.verified else "GOAL_SUCCESS_REJECTED",
+                    "Trusted goal-level verification recorded", {"goal_id": verification.goal_id,
+                    "evaluator": verification.evaluator, "verified": verification.verified})
+        if verification.verified and state.get("current_step") == "CANDIDATE_FOR_COMPLETION":
+            state.update(status="completed", current_step="COMPLETED", blocker=None,
+                         verified_evidence=list(verification.evidence_refs))
+            frame = state.get("goal_frame", {})
+            frame.update(current_milestone="COMPLETED",
+                         verified_evidence_refs=list(verification.evidence_refs))
+            self.store.put("goals", verification.goal_id, state)
+            self._event("GOAL_COMPLETED", "Goal completed from governed goal-level verification",
+                        {"goal_id": verification.goal_id})
+        return verification.verified
+
+    @staticmethod
+    def _action_identity(demand: CapabilityDemand) -> str:
+        canonical = {"capability": demand.required_capability, "intent": demand.intent,
+                     "inputs": demand.inputs, "expected_output": demand.expected_output,
+                     "expected_evidence": demand.expected_evidence,
+                     "side_effect_class": demand.side_effects,
+                     "reversible": demand.reversible}
+        return hashlib.sha256(json.dumps(canonical, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+
+    @staticmethod
+    def _effect_footprint(demand: CapabilityDemand) -> dict[str, Any]:
+        inputs = demand.inputs
+        target = next((str(inputs[key]) for key in ("path", "url", "resource", "account", "id")
+                       if key in inputs), None)
+        operation = demand.intent.lower()
+        semantics = ("delete" if operation in {"delete", "remove"} else
+                     "read" if operation in {"read", "hash", "exists", "get", "head", "research"} else
+                     "write" if operation in {"write", "append", "create"} else "mutate")
+        dependent = any("{evidence}" in value for value in inputs.values() if isinstance(value, str))
+        return {"capability": demand.required_capability, "operation": demand.intent,
+                "target": target, "side_effect_class": demand.side_effects,
+                "semantics": semantics, "depends_on_evidence": dependent,
+                "reversible": demand.reversible, "risk": demand.risk}
+
+    def _twin_decision(self, candidates: list[tuple[float, CapabilityDemand, dict[str, Any]]],
+                       interpretations: dict[str, dict[str, Any]]) -> tuple[str, str | None, list[tuple[float, CapabilityDemand, dict[str, Any]]]]:
+        if len(interpretations) < 2:
+            return "SINGLE", None, candidates
+        by_fingerprint: dict[str, list[tuple[float, CapabilityDemand, dict[str, Any]]]] = {}
+        for candidate in candidates:
+            by_fingerprint.setdefault(self._action_identity(candidate[1]), []).append(candidate)
+        if not by_fingerprint:
+            return "AGREE", None, []
+        if len(by_fingerprint) == 1:
+            return "AGREE", None, [max(next(iter(by_fingerprint.values())), key=lambda item: item[0])]
+        distinct = [max(group, key=lambda item: item[0]) for group in by_fingerprint.values()]
+        footprints = [self._effect_footprint(item[1]) for item in distinct]
+        compatible = all(item[1].reversible and item[1].risk <= .25 for item in distinct)
+        dependency = "ORDERED_DEPENDENCY" if any(item["depends_on_evidence"] for item in footprints) else "INDEPENDENT"
+        for index, left in enumerate(footprints):
+            for right in footprints[index + 1:]:
+                if left["target"] is None or right["target"] is None:
+                    compatible = compatible and left["semantics"] == right["semantics"] == "read"
+                elif left["target"] == right["target"]:
+                    compatible = compatible and left["semantics"] == right["semantics"] == "read"
+                elif "delete" in {left["semantics"], right["semantics"]}:
+                    compatible = False
+        if compatible:
+            ordered = sorted(distinct, key=lambda item: (
+                self._effect_footprint(item[1])["depends_on_evidence"], -item[1].information_gain))
+            return "COMPLEMENTARY", dependency, ordered
+        # Safety, reversibility and information value precede self-reported utility.
+        winner = max(distinct, key=lambda item: (item[1].reversible, -item[1].risk,
+            item[1].information_gain, item[0], self._action_identity(item[1])))
+        return "CONFLICT", None, [winner]
+
+    def advance_goal(self, goal_id: str) -> dict[str, Any]:
+        """Advance one bounded, durable goal step without replaying verified actions."""
+        rows = self.store.rows("SELECT state FROM goals WHERE id=?", (goal_id,))
+        if not rows: raise KeyError("unknown goal")
+        state = json.loads(rows[0]["state"])
+        if self._goal_frame_stable_digest(state.get("goal_frame", {})) != state.get("goal_frame_digest"):
+            raise RuntimeError("stable GoalFrame integrity check failed")
+        if state.get("status") in {"completed", "blocked"}:
+            return state
+        if state.get("status") == "budget_exhausted":
+            state["status"] = "active"
+        uncertain_actions = [entry for entry in state.get("action_ledger", {}).values()
+                             if entry.get("status") == "EXECUTING"]
+        if uncertain_actions:
+            state.update(status="blocked", blocker="EXECUTION", current_step="BLOCKED")
+            self.store.put("goals", goal_id, state)
+            return state
+        if state.get("pending_approval"):
+            state.update(status="waiting_owner", blocker="PERMISSION")
+            self.store.put("goals", goal_id, state); return state
+        if not self.intelligence_connected:
+            state.update(status="blocked", blocker="PROVIDER", current_step="BLOCKED")
+            self.store.put("goals", goal_id, state); return state
+
+        observations = [item for item in self.embodiment_store.all("observation")
+                        if item.get("goal_id") == goal_id]
+        evaluations = {item.get("observation_id"): item for item in
+                       self.embodiment_store.all("outcome_evaluation")}
+        positive = [item for item in observations if evaluations.get(item.get("action_id"), {}).get("correct")]
+        negative = [item for item in observations if item.get("action_id") in evaluations
+                    and not evaluations[item["action_id"]].get("correct")]
+        goal_checks = [json.loads(row["state"]) for row in self.store.rows(
+            "SELECT state FROM goal_success_verifications WHERE goal_id=? ORDER BY id", (goal_id,))]
+        trusted_goal_checks = [check for check in goal_checks if check.get("verified")]
+        goal_verified = bool(trusted_goal_checks)
+        if goal_verified and state.get("completion_requested"):
+            state.update(status="completed", current_step="COMPLETED", blocker=None,
+                         verified_evidence=trusted_goal_checks[-1]["evidence_refs"])
+            self.store.put("goals", goal_id, state)
+            self._event("GOAL_COMPLETED", "Goal completed from downstream verified outcome", {"goal_id": goal_id})
+            return state
+        if negative:
+            state.update(status="active", blocker="STRATEGY", current_step="REPLAN")
+
+        compact_evidence = [{"action_id": item["action_id"], "operation": item["operation"],
+                             "success": item["success"], "verification": item.get("verification_state"),
+                             "content_hash": item.get("content_hash"),
+                             "evidence_refs": item.get("evidence_refs", [])} for item in observations[-8:]]
+        recruit_twins = bool(state.get("stagnation_count") or state.get("escalate_twin") or state.get("blocker") in
+                             {"STRATEGY", "CAPABILITY", "EXECUTION", "OBJECTIVE"})
+        lineages = ("Saphira-A", "Saphira-B") if recruit_twins else (self._dynamic_primary(state["description"])[0],)
+        interpretations: dict[str, dict[str, Any]] = {}
+        used: set[str] = set()
+        for lineage in lineages:
+            record = self.router.choose(list(self.records.values()), "goal_advance", exclude=used,
+                                        policy=self.routing_policy)
+            used.add(record.key)
+            response = self._model_call(record, goal_id, state.get("episode_id"), "goal_advance", lineage,
+                "Using this compact GoalBrief, return only next_useful_action, body_demands, completion_requested, "
+                "uncertainty, risk, and blocker. Determine what is missing, which assumption matters, what evidence "
+                "would reduce uncertainty, why the prior route failed, and what different safe experiment should run. "
+                "Classify blocker as INFORMATION, CAPABILITY, PERMISSION, PROVIDER, STRATEGY, OBJECTIVE, or EXECUTION. "
+                "Never claim completion from model judgment and do not return private reasoning.",
+                {"owner_goal": state["description"], "step": state.get("step_count", 1),
+                 "prior_action": state.get("next_action"), "blocker": state.get("blocker"),
+                 "verified_operational_evidence": compact_evidence})
+            interpretations[lineage] = {"model": self._last_model_key, "argument": response}
+
+        chosen = next(iter(interpretations.values()))["argument"]
+        demands = self._structured_demands(goal_id, state.get("episode_id") or uuid4().hex,
+                                           state["description"], interpretations, [])
+        twin_decision, dependency, selected_demands = self._twin_decision(demands, interpretations)
+        state["twin_decision"] = twin_decision
+        state["twin_decision_facts"] = {"relation": twin_decision,
+            "dependency": dependency,
+            "lineages": sorted(interpretations), "proposal_count": len(demands),
+            "selected_fingerprints": [self._action_identity(item[1]) for item in selected_demands]}
+        ledger = state.setdefault("action_ledger", {})
+        prior_evidence_count = len(observations)
+        causal_step = state.get("step_count", 1) + 1
+        unique = []
+        for candidate in selected_demands:
+            fingerprint = self._action_identity(candidate[1])
+            prior = ledger.get(fingerprint)
+            if prior and prior.get("step") != causal_step:
+                meaningful_change = prior.get("evidence_count", 0) != prior_evidence_count
+                if not meaningful_change:
+                    state["stagnation_count"] = state.get("stagnation_count", 0) + 1
+                else:
+                    prior["evidence_count"] = prior_evidence_count
+                continue
+            unique.append(candidate)
+        state["_current_causal_step"] = causal_step
+        body = self._run_body_plan(state, unique, interpretations) if unique else None
+        state.pop("_current_causal_step", None)
+        state["step_count"] = causal_step
+        state["next_action"] = chosen.get("next_useful_action")
+        state["completion_requested"] = chosen.get("completion_requested") is True
+        proposed_blocker = str(chosen.get("blocker") or "").upper()
+        state["blocker"] = self._blocker_for(state, body) or (
+            proposed_blocker if proposed_blocker in self.BLOCKER_CLASSES else None)
+        state["escalate_twin"] = (float(chosen.get("uncertainty", 0)) >= .5
+                                  or float(chosen.get("risk", 0)) >= .4
+                                  or state["completion_requested"] and not goal_verified)
+        state["current_step"] = ("METACOGNITION" if state.get("stagnation_count") else
+                                 "CANDIDATE_FOR_COMPLETION" if state["completion_requested"] else
+                                 state.get("current_step", "REPLAN"))
+        if state.get("stagnation_count", 0) >= 3:
+            state.update(status="blocked", current_step="BLOCKED", blocker="STRATEGY")
+        elif body and body.get("status") == "pending_approval":
+            state.update(status="waiting_owner", blocker="PERMISSION")
+        else:
+            state["status"] = "active"
+        state["goal_frame"].update(current_milestone=state["current_step"],
+            blocker=state.get("blocker"), verified_evidence_refs=[item["action_id"] for item in positive],
+            next_move=state.get("next_action"), step_count=state["step_count"])
+        self.store.put("goals", goal_id, state)
+        self._event("GOAL_ADVANCED", "Durable goal advanced one bounded step",
+                    {"goal_id": goal_id, "step": state["step_count"], "blocker": state.get("blocker"),
+                     "twin_recruited": len(lineages) == 2})
+        return state
+
+    def run_goal(self, goal_id: str, max_steps: int = 1) -> dict[str, Any]:
+        if not 1 <= max_steps <= 50: raise ValueError("max_steps must be between 1 and 50")
+        state: dict[str, Any] = {}
+        for _ in range(max_steps):
+            state = self.advance_goal(goal_id)
+            if state.get("status") in {"completed", "waiting_owner", "blocked"}: return state
+        if state.get("status") == "active":
+            state["status"] = "budget_exhausted"; state["current_step"] = "BUDGET_EXHAUSTED"
+            self.store.put("goals", goal_id, state)
+        return state
 
     def _dynamic_primary(self, text: str) -> tuple[str, Any]:
         tokens = set(text.lower().split())
@@ -547,15 +961,31 @@ class GodRuntime:
                 candidates.append((utility, demand, data))
         # Compare utilities within an inference stage, while cheap information-gathering
         # actions precede actions whose output depends on that evidence.
-        return sorted(candidates, key=lambda x: (x[2]["side_effect_class"] not in {"none", "read"}, -x[0]))
+        return sorted(candidates, key=lambda x: (
+            x[2]["side_effect_class"] not in {"none", "read"}, -x[0],
+            hashlib.sha256(json.dumps({"intent": x[1].intent, "inputs": x[1].inputs},
+                                     sort_keys=True).encode()).hexdigest()))
 
     def _run_body_plan(self, state: dict[str, Any], candidates: list[tuple[float, CapabilityDemand, dict[str, Any]]], interpretations: dict[str, dict[str, Any]]) -> dict[str, Any]:
         observations = []; evidence = ""
+        ledger = state.setdefault("action_ledger", {})
         # Execute the best candidate per intent in utility order, permitting research then save.
         seen = set()
         for _, demand, raw in candidates:
             if demand.intent in seen: continue
             seen.add(demand.intent)
+            fingerprint = self._action_identity(demand)
+            existing = ledger.get(fingerprint)
+            if existing and existing.get("status") in {"OBSERVED", "VERIFIED", "FAILED", "EXECUTING", "WAITING_APPROVAL"}:
+                # EXECUTING after a crash is deliberately not retried: the host
+                # cannot prove the prior side effect did not occur.
+                continue
+            ledger[fingerprint] = {"fingerprint": fingerprint, "status": "PROPOSED",
+                "step": state.get("_current_causal_step", state.get("step_count", 1)),
+                "evidence_count": len(self.embodiment_store.all("observation")),
+                "capability": demand.required_capability, "intent": demand.intent,
+                "reversible": demand.reversible, "action_id": None}
+            self.store.put("goals", state["id"], state)
             winner = None
             provenance = next((item for item in self.embodiment_store.all("decision_provenance")
                                if item["id"] == demand.decision_provenance_id), {})
@@ -573,29 +1003,39 @@ class GodRuntime:
                 winner = self._develop_gap(demand, interpretations)
                 resolved = self.capability_resolver.resolve(demand) if winner is not None else None
                 if resolved is None:
+                    ledger[fingerprint]["status"] = "RETRYABLE"
+                    self.store.put("goals", state["id"], state)
                     return {"status":"gap"}
                 state.update(current_step="body_execution", current_organ=resolved[0].id)
                 self.store.put("goals", state["id"], state)
                 self._event("CAPABILITY_RESOLVED", f"Developed demand resolved to {resolved[0].id}",
                             {"goal_id": state["id"], "organ": resolved[0].id, "demand_id": demand.id})
+            ledger[fingerprint]["status"] = "EXECUTING"
+            self.store.put("goals", state["id"], state)
             result = self.action_loop.execute(demand)
             if isinstance(result, HumanApprovalRequest):
+                ledger[fingerprint].update(status="WAITING_APPROVAL", approval_request_id=result.id)
                 state.update(current_step="pending_approval", pending_approval=result.id); self.store.put("goals",state["id"],state)
                 if acting_colony: self._sister_transition(acting_colony, state["id"], "WAITING", "Waiting for Pier approval")
                 return {"status":"pending_approval","request":asdict(result)}
             if not isinstance(result, ObservationEnvelope):
+                ledger[fingerprint]["status"] = "FAILED"
                 state.update(current_step="capability_gap"); self.store.put("goals",state["id"],state)
                 return {"status":"gap"}
+            ledger[fingerprint].update(status="OBSERVED", action_id=result.action_id)
+            self.store.put("goals", state["id"], state)
             if acting_colony: self._sister_transition(acting_colony, state["id"], "ACTING", "Body operation invoked")
             if acting_colony: self._sister_transition(acting_colony, state["id"], "VERIFYING", "Checking body observation")
             level = VerificationLevel.TRANSPORT_VERIFIED if demand.required_capability == "web" else VerificationLevel.ARTIFACT_VERIFIED
             verified = self.action_loop.verify(result, lambda obs: obs.success and bool(obs.content_hash), level)
             if not result.success:
+                ledger[fingerprint]["status"] = "FAILED"
                 state.update(status="failed", current_step="FAILED", last_observation=result.action_id)
                 self.store.put("goals", state["id"], state)
                 if acting_colony: self._sister_transition(acting_colony, state["id"], "BLOCKED", "Body invocation failed")
                 return {"status": "failed", "observations": [asdict(result)]}
             if verified:
+                ledger[fingerprint]["status"] = "VERIFIED"
                 manifest = self.body_bus.manifests[result.organ]
                 manifest.verified_reliability = min(1, manifest.verified_reliability + .01)
                 if winner is not None:
@@ -630,7 +1070,16 @@ class GodRuntime:
         data = next(o for o in self.embodiment_store.all("observation") if o["action_id"] == evaluation.observation_id)
         observation = ObservationEnvelope(**{**data, "evidence_refs": tuple(data["evidence_refs"])})
         self.embodiment_store.put("outcome_evaluation", evaluation.observation_id, evaluation)
-        if not evaluation.correct: return self.action_loop.verify(observation, lambda _: False, VerificationLevel.OUTCOME_VERIFIED)
+        if not evaluation.correct:
+            self.action_loop.verify(observation, lambda _: False, VerificationLevel.OUTCOME_VERIFIED)
+            goal_rows = self.store.rows("SELECT state FROM goals WHERE id=?", (observation.goal_id,))
+            if goal_rows:
+                goal = json.loads(goal_rows[0]["state"])
+                goal.update(status="active", current_step="REPLAN", blocker="STRATEGY")
+                self.store.put("goals", observation.goal_id, goal)
+            self._event("NEGATIVE_OUTCOME", "Verified negative outcome requires replanning",
+                        {"goal_id": observation.goal_id})
+            return False
         if not observation.decision_provenance_id: return False
         matches = [p for p in self.embodiment_store.all("decision_provenance") if p["id"] == observation.decision_provenance_id]
         if len(matches) != 1: return False
@@ -685,14 +1134,9 @@ class GodRuntime:
         return len(set(normalized)) > 1
 
     def _learn_neurons(self, decisions: list[Any], stimulus: str) -> None:
-        for decision in decisions:
-            colony = self.organism.colonies[decision.colony_name]
-            for neuron_id in decision.neuron_ids:
-                neuron = colony.neurons[neuron_id]
-                neuron.specialize(decision.purpose.value, stimulus)
-                # Successful cognition is useful experience, not verified real-world evidence.
-                neuron.confidence = min(1, neuron.confidence + .01)
-            colony.memories.append(decision.purpose.value)
+        # A syntactically valid model response is not verified learning.
+        # Attribution and competence updates occur only in evaluate_outcome().
+        return
 
     def _dissolve(self) -> None:
         for colony in self.organism.colonies.values():
@@ -742,10 +1186,14 @@ class GodRuntime:
         last = observations[-1] if observations else None
         selected_rows = self.store.rows("SELECT * FROM model_selections ORDER BY started_at DESC LIMIT 1")
         selected = dict(selected_rows[0]) if selected_rows else None
+        selected_key = f'{selected["provider"]}:{selected["model_id"]}' if selected else None
+        selected_record = self.records.get(selected_key) if selected_key else None
+        resource_class = (selected_record.cost_classification if selected_record else
+                          "NO FREE SAFE INTELLIGENCE AVAILABLE")
         return {"current_goal": goal.get("description"), "work_class": goal.get("work_class"),
                 "current_step": goal.get("current_step","idle"), "current_organ": goal.get("current_organ"),
                 "selected_colony": goal.get("selected_colony") or (selected.get("colony") if selected else None),
-                "selected_model": f'{selected["provider"]}:{selected["model_id"]}' if selected else None,
+                "selected_model": selected_key, "intelligence_resource": resource_class,
                 "routing_reason": selected.get("routing_reason") if selected else None,
                 "prediction": predictions[-1] if predictions else None,
                 "observation": last, "verification": last.get("verification") if last else None,
@@ -765,6 +1213,9 @@ class GodRuntime:
             goal_rows = self.store.rows("SELECT state FROM goals WHERE id=?", (request["goal_id"],))
             if goal_rows:
                 state = json.loads(goal_rows[0]["state"])
+                for entry in state.get("action_ledger", {}).values():
+                    if entry.get("approval_request_id") == request_id:
+                        entry["status"] = "SUPERSEDED"
                 state.update(status="blocked", current_step="DENIED", pending_approval=None)
                 self.store.put("goals", state["id"], state)
             return
@@ -781,6 +1232,10 @@ class GodRuntime:
         if isinstance(result, ObservationEnvelope):
             level = VerificationLevel.TRANSPORT_VERIFIED if manifest.kind == "web" else VerificationLevel.ARTIFACT_VERIFIED
             self.action_loop.verify(result, lambda observation: observation.success and bool(observation.content_hash), level)
+            for entry in state.get("action_ledger", {}).values():
+                if entry.get("approval_request_id") == request_id:
+                    entry.update(status="VERIFIED" if result.success else "FAILED",
+                                 action_id=result.action_id)
             state.update(status="awaiting_outcome", current_step="AWAITING_OUTCOME", current_organ=request["organ"],
                          last_observation=result.action_id, pending_approval=None)
             self.store.put("goals", state["id"], state)
@@ -805,15 +1260,9 @@ class GodRuntime:
             answer = self._state_answer(lower, active)
         else:
             if not self.intelligence_connected:
-                raise ProviderUnavailable("external intelligence is disconnected")
-            record = self.router.choose(list(self.records.values()), "conversation",
-                                        policy=self.routing_policy)
+                raise ProviderUnavailable("NO_FREE_SAFE_INTELLIGENCE_AVAILABLE")
             persisted = json.loads(active[0]["state"]) if active else None
-            result = self._model_call(record, persisted.get("id") if persisted else None,
-                persisted.get("episode_id") if persisted else None, "conversation", None,
-                "Reply naturally and truthfully. Do not invent activity; use only supplied persisted state.",
-                {"message": message, "active_goal": persisted})
-            answer = str(result.get("answer", result.get("response", "I do not have an answer.")))
+            answer = self._conversation_call(message, persisted)
         self.store.chat("assistant", answer)
         return answer
 

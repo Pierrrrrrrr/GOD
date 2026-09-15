@@ -17,5 +17,6 @@ set "PYTHONPATH=%~dp0src"
 py -3 -m tmco.web --data "%LOCALAPPDATA%\GOD"
 if errorlevel 1 (
   echo G.O.D. could not start. Check the message above and your provider configuration.
+  echo Safe diagnostic: py -3 -m tmco.web --data "%LOCALAPPDATA%\GOD" --doctor
   pause
 )

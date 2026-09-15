@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from typing import Any, Callable, Protocol
+from .data_policy import DataClass, OutboundDataPolicy
 
 
 class ProviderUnavailable(RuntimeError):
@@ -9,7 +10,7 @@ class ProviderUnavailable(RuntimeError):
 
 
 class ModelProvider(Protocol):
-    def infer(self, request: dict[str, Any]) -> dict[str, Any]: ...
+    def infer(self, request: dict[str, Any]) -> dict[str, Any] | str: ...
 
 
 class TestProvider:
@@ -45,6 +46,7 @@ class OrganManifest:
 class ModelBus:
     def __init__(self, providers: dict[str, ModelProvider] | None = None, *, production: bool = False):
         self.production = production
+        self.outbound_policy = OutboundDataPolicy()
         self.providers: dict[str, ModelProvider] = {}
         for name, provider in (providers or {}).items(): self.register(name, provider)
 
@@ -53,10 +55,20 @@ class ModelBus:
             raise ProviderUnavailable("test-only model providers are rejected by the production bus")
         self.providers[name] = provider
 
-    def request(self, provider: str, request: dict[str, Any]) -> dict[str, Any]:
+    def request(self, provider: str, request: dict[str, Any]) -> dict[str, Any] | str:
         if provider not in self.providers:
             raise ProviderUnavailable(f"model provider {provider!r} is not configured")
-        return self.providers[provider].infer(request)
+        organ = self.providers[provider]
+        remote = getattr(organ, "privacy", "remote") != "local"
+        raw_classes = request.pop("data_classes", ())
+        classes = {item if isinstance(item, DataClass) else DataClass(item) for item in raw_classes}
+        if remote and not classes:
+            raise PermissionError("remote inference requires outbound data classification")
+        self.outbound_policy.validate(classes, remote=remote,
+            artifact_id=request.pop("artifact_id", None), content_hash=request.pop("content_hash", None),
+            provider=provider, purpose=request.pop("outbound_purpose", None),
+            approval=request.pop("disclosure_approval", None))
+        return organ.infer(request)
 
 
 class BodyBus:

@@ -5,7 +5,7 @@ import json
 import urllib.request
 from typing import Any, Protocol
 
-from .models import HTTPModelProvider, ModelRecord
+from .models import HTTPModelProvider, ModelRecord, ResponseMode, _bounded_json
 
 
 class ProviderConnector(Protocol):
@@ -13,7 +13,7 @@ class ProviderConnector(Protocol):
 
     def probe(self, model_id: str) -> None: ...
     def discover(self) -> list[ModelRecord]: ...
-    def infer(self, request: dict[str, Any]) -> dict[str, Any]: ...
+    def infer(self, request: dict[str, Any]) -> dict[str, Any] | str: ...
 
 
 def _price(value: object) -> float | None:
@@ -26,18 +26,19 @@ def _price(value: object) -> float | None:
 
 
 class CatalogConnector:
+    privacy = "remote"
     name: str
 
     def __init__(self, transport: HTTPModelProvider):
         self.transport = transport
 
-    def infer(self, request: dict[str, Any]) -> dict[str, Any]:
+    def infer(self, request: dict[str, Any]) -> dict[str, Any] | str:
         return self.transport.infer(request)
 
     def probe(self, model_id: str) -> None:
-        answer = self.infer({"model_id": model_id,
-                             "prompt": "Capability probe. Return only JSON: {\"probe\": true}"})
-        if answer.get("probe") is not True:
+        answer = self.infer({"model_id": model_id, "response_mode": ResponseMode.TEXT.value,
+                             "prompt": "Synthetic capability probe. Reply with OK."})
+        if not isinstance(answer, str) or not answer.strip():
             raise RuntimeError("provider capability probe failed")
 
 
@@ -45,15 +46,12 @@ class OpenRouterConnector(CatalogConnector):
     name = "openrouter"
 
     def __init__(self, api_key: str):
-        super().__init__(HTTPModelProvider("https://openrouter.ai/api/v1/chat/completions", api_key))
+        super().__init__(HTTPModelProvider("https://openrouter.ai/api/v1/chat/completions", api_key,
+                                           openrouter=True))
 
     def discover(self) -> list[ModelRecord]:
         records = [self._normalize(item) for item in self.transport.catalog()]
         records = [record for record in records if record is not None]
-        # This gateway alias selects a currently available free model; it is not a
-        # hard-coded underlying model and remains useful if catalog pricing is sparse.
-        if not any(record.model_id == "openrouter/free" for record in records):
-            records.append(ModelRecord(self.name, "openrouter/free", input_cost=0, output_cost=0))
         return records
 
     def _normalize(self, item: dict[str, Any]) -> ModelRecord | None:
@@ -61,13 +59,14 @@ class OpenRouterConnector(CatalogConnector):
         if not model_id:
             return None
         architecture, pricing = item.get("architecture", {}), item.get("pricing", {})
+        supported = item.get("supported_parameters", [])
         return ModelRecord(self.name, model_id,
                            modalities=list(architecture.get("input_modalities", ["text"])),
                            context_capability=item.get("context_length"),
-                           tool_capability=bool(item.get("supported_parameters") and
-                                                "tools" in item["supported_parameters"]),
+                           tool_capability="tools" in supported,
                            input_cost=_price(pricing.get("prompt")),
-                           output_cost=_price(pricing.get("completion")))
+                           output_cost=_price(pricing.get("completion")), corporate_safe=True,
+                           structured_capability="response_format" in supported)
 
 
 class GeminiConnector(CatalogConnector):
@@ -103,6 +102,7 @@ class OpenAICompatibleConnector(CatalogConnector):
 
 class OllamaConnector:
     name = "ollama"
+    privacy = "local"
 
     def __init__(self, endpoint: str = "http://127.0.0.1:11434"):
         self.endpoint = endpoint.rstrip("/")
@@ -112,7 +112,7 @@ class OllamaConnector:
                                          data=json.dumps(body).encode() if body else None,
                                          headers={"Content-Type": "application/json"})
         with urllib.request.urlopen(request, timeout=2) as response:
-            return json.load(response)
+            return _bounded_json(response)
 
     def discover(self) -> list[ModelRecord]:
         try:
@@ -120,15 +120,22 @@ class OllamaConnector:
         except Exception:
             return []
         return [ModelRecord(self.name, item["name"], input_cost=0, output_cost=0,
-                            privacy="local", availability=True)
+                            privacy="local", availability=True, corporate_safe=True)
                 for item in models if item.get("name")]
 
     def probe(self, model_id: str) -> None:
         if not any(record.model_id == model_id for record in self.discover()):
             raise RuntimeError("local model is unavailable")
 
-    def infer(self, request: dict[str, Any]) -> dict[str, Any]:
+    def infer(self, request: dict[str, Any]) -> dict[str, Any] | str:
+        mode = ResponseMode(request.get("response_mode", ResponseMode.STRUCTURED.value))
         payload = self._json("/api/chat", {"model": request["model_id"], "stream": False,
-                                           "format": "json", "messages": [
+                                           **({"format": "json"} if mode is ResponseMode.STRUCTURED else {}), "messages": [
                                                {"role": "user", "content": request["prompt"]}]})
-        return json.loads(payload["message"]["content"])
+        content = payload["message"]["content"]
+        if mode is ResponseMode.TEXT:
+            return str(content)
+        value = json.loads(content)
+        if not isinstance(value, dict):
+            raise RuntimeError("structured model response must be an object")
+        return value
