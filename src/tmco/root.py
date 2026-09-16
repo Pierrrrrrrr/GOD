@@ -185,6 +185,12 @@ class RootKernel:
     def verify_owner_capability(self, payload: bytes, signature: str) -> bool:
         return self._guard.verify(b"GOD:OWNER-CAPABILITY:v1\0" + payload, signature)
 
+    def sign_emergency(self, payload: bytes) -> str:
+        return self._guard.sign(b"GOD:EMERGENCY:v1\0" + payload)
+
+    def verify_emergency(self, payload: bytes, signature: str) -> bool:
+        return self._guard.verify(b"GOD:EMERGENCY:v1\0" + payload, signature)
+
     @property
     def key_fingerprint(self) -> str:
         return self._guard.fingerprint

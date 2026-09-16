@@ -44,8 +44,10 @@ class OrganManifest:
 
 
 class ModelBus:
-    def __init__(self, providers: dict[str, ModelProvider] | None = None, *, production: bool = False):
+    def __init__(self, providers: dict[str, ModelProvider] | None = None, *, production: bool = False,
+                 emergency: Any | None = None):
         self.production = production
+        self.emergency = emergency
         self.outbound_policy = OutboundDataPolicy()
         self.providers: dict[str, ModelProvider] = {}
         for name, provider in (providers or {}).items(): self.register(name, provider)
@@ -56,10 +58,13 @@ class ModelBus:
         self.providers[name] = provider
 
     def request(self, provider: str, request: dict[str, Any]) -> dict[str, Any] | str:
+        if self.emergency is not None: self.emergency.require_new_work_allowed()
         if provider not in self.providers:
             raise ProviderUnavailable(f"model provider {provider!r} is not configured")
         organ = self.providers[provider]
         remote = getattr(organ, "privacy", "remote") != "local"
+        if self.emergency is not None:
+            if remote: self.emergency.require_remote_models_allowed()
         raw_classes = request.pop("data_classes", ())
         classes = {item if isinstance(item, DataClass) else DataClass(item) for item in raw_classes}
         if remote and not classes:
@@ -73,7 +78,8 @@ class ModelBus:
 
 class BodyBus:
     """Single typed boundary for all physical capabilities; no fallback effects."""
-    def __init__(self) -> None:
+    def __init__(self, emergency: Any | None = None) -> None:
+        self.emergency = emergency
         self.manifests: dict[str, OrganManifest] = {}
         self.handlers: dict[tuple[str, str], Callable[[dict[str, Any]], Any]] = {}
 
@@ -84,6 +90,9 @@ class BodyBus:
         for operation, handler in handlers.items(): self.handlers[(manifest.id, operation)] = handler
 
     def request(self, organ: str, operation: str, arguments: dict[str, Any]) -> Any:
+        if self.emergency is not None:
+            self.emergency.require_new_work_allowed()
+            self.emergency.require_external_effects_allowed()
         manifest = self.manifests.get(organ)
         handler = self.handlers.get((organ, operation))
         if manifest is None or not manifest.available or handler is None:

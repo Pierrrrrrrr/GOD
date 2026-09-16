@@ -8,7 +8,7 @@ import time
 from dataclasses import asdict, dataclass
 from enum import StrEnum
 from pathlib import Path
-from typing import Callable
+from typing import Any, Callable
 from uuid import uuid4
 
 from .root import AuthorizationError, RootKernel
@@ -63,8 +63,10 @@ class CapabilityRequester:
 
 
 class OwnerCapabilityAuthority:
-    def __init__(self, root: RootKernel, path: Path, now: Callable[[], float] = time.time):
+    def __init__(self, root: RootKernel, path: Path, now: Callable[[], float] = time.time,
+                 emergency: Any | None = None):
         self.__root, self.__now = root, now
+        self.__emergency = emergency
         self.__host_token = object()
         path.parent.mkdir(parents=True, exist_ok=True)
         self.__db = sqlite3.connect(path)
@@ -95,6 +97,7 @@ class OwnerCapabilityAuthority:
                           (request_id, json.dumps(state, sort_keys=True))); self.__db.commit()
 
     def request(self, request: CapabilityRequest) -> str:
+        if self.__emergency is not None: self.__emergency.require_new_work_allowed()
         if request.owner != self.__root.owner or not request.non_delegable or not request.executor_principal:
             raise AuthorizationError("request must be owner-bound, executor-bound, and non-delegable")
         request_id = uuid4().hex
@@ -128,6 +131,9 @@ class OwnerCapabilityAuthority:
             raise AuthorizationError("approval is not bound to this host authority")
 
     def start(self, capability: OwnerCapability, actual: CapabilityRequest, *, executor_principal: str) -> None:
+        if self.__emergency is not None:
+            self.__emergency.require_new_work_allowed()
+            self.__emergency.require_external_effects_allowed()
         state = self._get(capability.request_id)
         if state["consumed"]: raise AuthorizationError("owner capability has already been used")
         if state["revoked"] or state["status"] != SetupState.AUTHORIZED: raise AuthorizationError("workflow is not authorized")

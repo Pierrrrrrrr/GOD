@@ -9,6 +9,8 @@ requires-python = ">=3.11"
 
 [project.scripts]
 god-awaken = "tmco.web:main"
+god-owner-control = "tmco.owner_control:main"
+god-ontogeny = "tmco.ontogeny_cli:main"
 
 [tool.pytest.ini_options]
 pythonpath = ["src"]

@@ -14,6 +14,8 @@ from .memory import MemoryKernel
 from .morphogenesis import AssemblyFormationPolicy
 from .persistence import EventStore
 from .root import AuthorizationError, RootGuard, RootKernel, root_secret_store
+from .emergency import EmergencyAuthority
+from .paths import ProductPaths
 from .runtime import Colony
 from .types import (AssemblyPurpose, ComputeBudget, DigitalNeuron, Goal, GoalStatus,
                     Neuromodulators, Synapse, WorkspaceItem)
@@ -49,9 +51,15 @@ class TMCOSystem:
             self.store.append("boot", {"colonies": list(self.colonies),
                                        "root_key_reference": self.root.key_reference})
             self._commit_state("initialization")
+        # TMCOSystem is the sole owner of emergency authority for this organism.
+        product_root = path.parent if path.name == "organism" else path
+        self.emergency = EmergencyAuthority(self.root, ProductPaths.resolve(product_root))
+        self.model_bus.emergency = self.emergency
+        self.body_bus.emergency = self.emergency
 
     def submit_goal(self, description: str, success_criteria: tuple[str, ...],
                     constraints: dict[str, Any] | None = None) -> Goal:
+        self.emergency.require_new_work_allowed()
         if not description.strip():
             raise ValueError("goal description is required")
         goal = Goal(uuid4().hex, description, success_criteria, constraints or {})
