@@ -14,6 +14,7 @@ from .memory import MemoryKernel
 from .morphogenesis import AssemblyFormationPolicy
 from .persistence import EventStore
 from .root import AuthorizationError, RootGuard, RootKernel, root_secret_store
+from .emergency import EmergencyAuthority
 from .runtime import Colony
 from .types import (AssemblyPurpose, ComputeBudget, DigitalNeuron, Goal, GoalStatus,
                     Neuromodulators, Synapse, WorkspaceItem)
@@ -21,7 +22,7 @@ from .workspace import GlobalWorkspace
 
 
 class TMCOSystem:
-    def __init__(self, path: Path, cognition: Cognition, *, owner: str = "owner",
+    def __init__(self, path: Path, cognition: Cognition, *, owner: str = "Pier",
                  secret: str | bytes | None = None, executor: ActionExecutor | None = None,
                  observation_provider: ObservationProvider | None = None,
                  formation_policy: AssemblyFormationPolicy | None = None):
@@ -35,7 +36,7 @@ class TMCOSystem:
         root_guard = (RootGuard(injected) if injected is not None else
                       root_secret_store(path).load_or_create(existing_organism=saved is not None))
         if saved:
-            self._restore(saved, root_guard)
+            self._restore(saved, root_guard, owner)
         else:
             self.root = RootKernel(owner, root_guard)
             self.root.record("root_initialized", {"owner": owner,
@@ -49,6 +50,9 @@ class TMCOSystem:
             self.store.append("boot", {"colonies": list(self.colonies),
                                        "root_key_reference": self.root.key_reference})
             self._commit_state("initialization")
+        self.emergency = EmergencyAuthority(self.root, path)
+        self.model_bus.emergency = self.emergency
+        self.body_bus.emergency = self.emergency
 
     def submit_goal(self, description: str, success_criteria: tuple[str, ...],
                     constraints: dict[str, Any] | None = None) -> Goal:
@@ -170,7 +174,7 @@ class TMCOSystem:
                 "goals": {k: {**asdict(v), "success_criteria": list(v.success_criteria),
                                "status": v.status.value} for k, v in self.goals.items()}, "idle": self.idle}
 
-    def _restore(self, state: dict[str, Any], root_guard: RootGuard) -> None:
+    def _restore(self, state: dict[str, Any], root_guard: RootGuard, expected_owner: str) -> None:
         root = state["root"]
         if root_guard.fingerprint != root["key_fingerprint"]:
             raise AuthorizationError("root key does not match checkpoint verification material")
@@ -182,8 +186,16 @@ class TMCOSystem:
                             if entry["kind"] == "root_initialized"), None)
         if initialized is None or initialized["payload"]["owner"] != root["owner"]:
             raise AuthorizationError("checkpoint attempted to alter root ownership")
-        if tuple(root["constitution"]) != self.root.constitution:
+        saved_constitution = tuple(root["constitution"])
+        legacy = self.root.constitution[:3]
+        if saved_constitution not in (legacy, self.root.constitution):
             raise AuthorizationError("checkpoint attempted to alter root constitution")
+        if root["owner"] != expected_owner:
+            if root["owner"] != "owner" or expected_owner != "Pier":
+                raise AuthorizationError("checkpoint owner does not match canonical owner")
+            self.root.record("canonical_owner_migrated", {"from_legacy_placeholder": True,
+                                                           "owner": "Pier"})
+            self.root._owner = "Pier"
         derived: dict[str, set[str]] = {}
         for entry in self.root.audit:
             if entry["kind"] == "privilege_granted":

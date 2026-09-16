@@ -133,16 +133,27 @@ def root_secret_store(directory: Path) -> RootSecretStore:
 
 @dataclass(slots=True)
 class RootKernel:
-    owner: str
+    _owner: str
     _guard: RootGuard = field(repr=False)
     key_reference: str = "root.key"
     constitution: tuple[str, ...] = (
         "root_policy_is_not_an_evolution_target",
         "cognition_cannot_grant_privileges",
         "external_effects_require_explicit_permission",
+        "owner_identity_is_not_an_evolution_target",
+        "root_emergency_override_is_not_an_evolution_target",
+        "cognition_cannot_redefine_owner",
+        "cognition_cannot_clear_emergency_stop",
+        "cells_cannot_grant_owner_authority",
+        "authenticated_owner_stop_has_absolute_priority",
+        "emergency_lockdown_blocks_new_external_effects",
+        "absence_of_intelligence_cannot_block_owner_stop",
     )
     permissions: dict[str, set[str]] = field(default_factory=dict)
     audit: list[dict[str, Any]] = field(default_factory=list)
+
+    @property
+    def owner(self) -> str: return self._owner
 
     def authorize(self, principal: str, permission: str, *, cognitive: bool = False) -> None:
         allowed = not cognitive and permission in self.permissions.get(principal, set())
@@ -184,6 +195,12 @@ class RootKernel:
 
     def verify_owner_capability(self, payload: bytes, signature: str) -> bool:
         return self._guard.verify(b"GOD:OWNER-CAPABILITY:v1\0" + payload, signature)
+
+    def sign_owner_attestation(self, payload: bytes) -> str:
+        return self._guard.sign(b"GOD:OWNER-ATTESTATION:v1\0" + payload)
+
+    def verify_owner_attestation(self, payload: bytes, signature: str) -> bool:
+        return self._guard.verify(b"GOD:OWNER-ATTESTATION:v1\0" + payload, signature)
 
     @property
     def key_fingerprint(self) -> str:

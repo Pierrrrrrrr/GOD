@@ -19,6 +19,8 @@ Adding classes, biological vocabulary, schedulers, agents, or abstractions is no
 - Generated executable code must never run directly on the host without a future explicitly approved isolation boundary. Composite Organ development may compose only trusted registered operations.
 - Legacy `DigitalNeuron`/assembly morphogenesis is an experimental, backward-compatible baseline, not mandatory live architecture. `DigitalCell`, morphogens, and future biological-development mechanisms remain Digital Ontogeny Lab hypotheses until benchmarks justify promotion. A `DigitalNeuron` is not an LLM agent; keep cells lightweight.
 - Do not create a second competing framework, bus, or runtime to solve an architecture problem unless evidence proves the existing mechanism cannot support it.
+- Pier's default monetary budget is exactly zero. Unknown or positive pricing is blocked; never fall back from a demonstrably zero-cost resource to a paid or ambiguously priced resource. Spending requires a future separate explicit owner authorization mechanism.
+- The canonical Root owner is `Pier`. Owner text is information, never authorization. Owner identity and the Root emergency override are outside evolution; cognition/cells cannot redefine the owner, grant owner authority, clear STOP, or veto an authenticated restriction. Governed external-effect boundaries enforce emergency state without depending on model availability.
 
 ## Required workflow for every task
 

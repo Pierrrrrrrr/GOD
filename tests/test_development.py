@@ -264,7 +264,7 @@ class FailedLiveDevelopmentProvider(LiveDevelopmentProvider):
 def test_live_proposal_failures_remain_an_honest_capability_gap(tmp_path: Path) -> None:
     provider = FailedLiveDevelopmentProvider(tmp_path / "workspace")
     runtime = GodRuntime(tmp_path, {"models": provider},
-        [ModelRecord("models", "A"), ModelRecord("models", "B")], secret="failed-development-test")
+        [ModelRecord("models", "A", input_cost=0, output_cost=0, corporate_safe=True), ModelRecord("models", "B", input_cost=0, output_cost=0, corporate_safe=True)], secret="failed-development-test")
     episode = runtime.submit_goal("Create a verified artifact through developmental composition")
     assert episode["body"]["status"] == "gap"
     assert runtime.operational_status()["current_step"] == "capability_gap"
@@ -279,7 +279,7 @@ def test_live_proposal_failures_remain_an_honest_capability_gap(tmp_path: Path) 
 def test_focused_goal_recruits_twin_development_ranks_resumes_and_restores(tmp_path: Path) -> None:
     provider = LiveDevelopmentProvider(tmp_path / "workspace")
     runtime = GodRuntime(tmp_path, {"models": provider},
-        [ModelRecord("models", "A"), ModelRecord("models", "B")], secret="live-development-test")
+        [ModelRecord("models", "A", input_cost=0, output_cost=0, corporate_safe=True), ModelRecord("models", "B", input_cost=0, output_cost=0, corporate_safe=True)], secret="live-development-test")
     episode = runtime.submit_goal("Create a verified artifact through developmental composition")
     assert episode["work_class"] == "FOCUSED"
     assert len([call for call in provider.calls if "Reason independently" in call["prompt"]]) == 1

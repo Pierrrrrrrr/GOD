@@ -16,11 +16,21 @@ This roadmap advances G.O.D. by evidence/competence gates, not calendar phases o
 
 ## M1 — Durable Autonomous Goal Loop
 
+**Prerequisite product gate:** the loopback-only `CORPORATE_SAFE` UI, explicit text/structured
+model contracts, local-model discovery, bounded conversation failover, and honest unavailable
+states must remain operational. These recovery mechanisms do not by themselves satisfy M1.
+
 A goal survives interruption and continues through:
 
 > understand → choose the next useful action or experiment → act → observe → verify → update → continue/replan → completion, honest block, or owner decision
 
 **Gate:** demonstrate multi-step continuation and restart from durable state, bounded replanning, truthful completion/blocking, provider-failure recovery, and owner intervention through the production path.
+
+**Current evidence:** the production runtime now provides bounded one-step and multi-step entry
+points, durable action fingerprints and blockers, restart continuation, dynamic twin escalation,
+negative-outcome replanning, and outcome-gated completion. These claims remain scoped to the
+deterministic production-path tests; live external providers and Windows startup require manual
+verification.
 
 ## M2 — Verified Experience / Real Memory
 
@@ -57,6 +67,8 @@ Pursue legal, owner-governed economic objectives such as opportunity discovery, 
 ## M0 / Digital Ontogeny Lab — parallel research track
 
 `DigitalCell`, morphogen fields, stigmergy, lateral inhibition, meristems, Physarum-like routing, regeneration, and related hypotheses remain separate from production. Each competes against simple baselines under identical evaluators.
+
+M0-1 is active **lab-only research**: it adds the mathematical cell tournament and Root emergency invariants, but does not integrate cells into either production Saphira lineage. It cannot promote a laboratory hypothesis.
 
 **Gate:** only reproducible, measured winners with acceptable resource and safety behavior may be proposed for production promotion. Biological vocabulary or complexity is not evidence of competence.
 

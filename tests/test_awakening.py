@@ -27,8 +27,8 @@ class ScriptedOrgan:
             return {"disagreements": ["sequence versus experiment"],
                     "synthesis": "Run a bounded experiment, then sequence evidence.",
                     "selected_next_action": "run bounded experiment", "rationale": "It tests both claims."}
-        if "Reply naturally" in prompt:
-            return {"answer": "Hello Pier. I am ready, and I have not invented any active work."}
+        if request.get("response_mode") == "text":
+            return "Hello Pier. I am ready, and I have not invented any active work."
         action = "map dependencies" if self.perspective == "A" else "run an experiment"
         return {"desired_outcome": "a realistic result", "success_evidence": ["measured result"],
                 "constraints": ["bounded resources"], "unknowns": ["causal mechanism"],
@@ -53,7 +53,7 @@ class RecordingPolicy(AssemblyFormationPolicy):
 def runtime(path: Path, policy=None) -> GodRuntime:
     policy = policy or AssemblyFormationPolicy()
     return GodRuntime(path, {"alpha": ScriptedOrgan("A"), "beta": ScriptedOrgan("B")},
-                      [ModelRecord("alpha", "one"), ModelRecord("beta", "two")],
+                      [ModelRecord("alpha", "one", input_cost=0, output_cost=0, corporate_safe=True), ModelRecord("beta", "two", input_cost=0, output_cost=0, corporate_safe=True)],
                       formation_policy=policy, secret="awakening-test-key")
 
 
@@ -77,13 +77,12 @@ def test_full_awakening_audit_learning_and_restart(tmp_path: Path) -> None:
     expected_a_interpretation = episode2["interpretations"]["Saphira-A"]["argument"]
     assert first.organism.colonies["Saphira-A"].id != first.organism.colonies["Saphira-B"].id
     assert set(episode2["interpretations"]) == {"Saphira-A", "Saphira-B"}
-    assert policy.calls == 2 and learned_specializations > 0
-    # Compare task 2 with an inexperienced organism: the history, not just task wording,
-    # changes the state-sensitive colony/assembly decision.
+    assert policy.calls == 2 and learned_specializations == 0
+    # Unverified model traffic must not alter later competence-based assignment.
     control = runtime(tmp_path / "control")
     control_episode = control.submit_goal("Find a realistic way to reduce water waste again")
     assignment = lambda e: [(a["colony"], a["purpose"]) for a in e["assemblies"]]
-    assert assignment(episode2) != assignment(control_episode)
+    assert assignment(episode2) == assignment(control_episode)
     control.close()
     assert any(r.successes for r in first.records.values())
     assert all(not r.task_performance and r.calibration == .5 and r.quality_observations == 0
@@ -157,7 +156,7 @@ class SameProviderOrgan:
 def test_same_provider_routes_actual_models_and_cosmetic_difference_skips_audit(tmp_path: Path) -> None:
     organ = SameProviderOrgan(cosmetic=True)
     organism = GodRuntime(tmp_path, {"shared": organ},
-                          [ModelRecord("shared", "model-one"), ModelRecord("shared", "model-two")],
+                          [ModelRecord("shared", "model-one", input_cost=0, output_cost=0, corporate_safe=True), ModelRecord("shared", "model-two", input_cost=0, output_cost=0, corporate_safe=True)],
                           secret="test-key")
     episode = organism.submit_goal("Find a realistic way to compare harmless wording")
     assert set(organ.model_ids) == {"model-one", "model-two"}
@@ -171,18 +170,19 @@ def test_same_provider_routes_actual_models_and_cosmetic_difference_skips_audit(
 class ProbeProvider:
     valid = True
 
-    def __init__(self, endpoint: str, key: str, *, gemini: bool = False):
+    def __init__(self, endpoint: str, key: str, *, gemini: bool = False, **_kwargs):
         self.key = key
 
     def infer(self, request: dict) -> dict:
         if not self.valid: raise RuntimeError("safe failure")
-        if "Capability probe" in request["prompt"]: return {"probe": True}
-        return {"answer": "persist me"}
+        if "capability probe" in request["prompt"].lower():
+            return "OK" if request.get("response_mode") == "text" else {"probe": True}
+        return "persist me" if request.get("response_mode") == "text" else {"answer": "persist me"}
 
     def catalog(self) -> list[dict]:
         return [{"id": "chosen", "context_length": 8192,
                  "architecture": {"input_modalities": ["text", "image"]},
-                 "pricing": {"prompt": "0.000001", "completion": "0.000002"}}]
+                "pricing": {"prompt": "0", "completion": "0"}}]
 
 
 def test_connection_probe_metadata_and_visible_chat_restart(tmp_path: Path,
@@ -193,12 +193,12 @@ def test_connection_probe_metadata_and_visible_chat_restart(tmp_path: Path,
     ProbeProvider.valid = False
     failed = App(tmp_path)
     identities = {name: colony.id for name, colony in failed.runtime.organism.colonies.items()}
-    assert "Saphira-A ONLINE" in failed.status() and "Root SECURE" in failed.status()
+    assert "Saphira-A INITIALIZED" in failed.status() and "Root AUDIT VERIFIED" in failed.status()
     assert "Intelligence DISCONNECTED" in failed.status()
     assert failed.runtime.organism.memory is not None
-    with pytest.raises(ProviderUnavailable, match="disconnected"):
+    with pytest.raises(ProviderUnavailable, match="NO_FREE_SAFE_INTELLIGENCE_AVAILABLE"):
         failed.runtime.submit_goal("reason without an organ")
-    with pytest.raises(ProviderUnavailable, match="disconnected"):
+    with pytest.raises(ProviderUnavailable, match="NO_FREE_SAFE_INTELLIGENCE_AVAILABLE"):
         failed.chat("try to reason")
     assert not failed.runtime.store.rows("SELECT * FROM episodes")
     with pytest.raises(RuntimeError): failed.connect(values)
@@ -209,7 +209,7 @@ def test_connection_probe_metadata_and_visible_chat_restart(tmp_path: Path,
     assert {name: colony.id for name, colony in failed.runtime.organism.colonies.items()} == identities
     record = next(iter(failed.runtime.records.values()))
     assert record.context_capability == 8192 and record.modalities == ["text", "image"]
-    assert record.input_cost == .000001 and record.output_cost == .000002
+    assert record.input_cost == 0 and record.output_cost == 0
     assert "Intelligence CONNECTED" in failed.status()
     assert failed.chat("hello") == "persist me"
     failed.close()
@@ -217,10 +217,10 @@ def test_connection_probe_metadata_and_visible_chat_restart(tmp_path: Path,
     ProbeProvider.valid = False
     restored = App(tmp_path)
     assert {name: colony.id for name, colony in restored.runtime.organism.colonies.items()} == identities
-    assert "Saphira-A ONLINE" in restored.status() and "Root SECURE" in restored.status()
+    assert "Saphira-A INITIALIZED" in restored.status() and "Root AUDIT VERIFIED" in restored.status()
     assert "Intelligence DISCONNECTED" in restored.status()
     assert "Pier: hello" in restored.transcript and "G.O.D.: persist me" in restored.transcript
-    with pytest.raises(ProviderUnavailable, match="disconnected"):
+    with pytest.raises(ProviderUnavailable, match="NO_FREE_SAFE_INTELLIGENCE_AVAILABLE"):
         restored.runtime.submit_goal("still cannot reason")
 
     ProbeProvider.valid = True
@@ -233,7 +233,7 @@ def test_connection_probe_metadata_and_visible_chat_restart(tmp_path: Path,
 def test_verified_quality_requires_explicit_outcome() -> None:
     from tmco.models import ModelRouter
 
-    record = ModelRecord("provider", "model")
+    record = ModelRecord("provider", "model", input_cost=0, output_cost=0, corporate_safe=True)
     ModelRouter.observe_call(record, True, 12)
     assert record.successes == 1 and record.availability
     assert record.task_performance == {} and record.calibration == .5
@@ -268,7 +268,7 @@ def test_local_server_get_keeps_sqlite_on_server_thread_and_closes(tmp_path: Pat
                 f"http://127.0.0.1:{server.server_address[1]}/", timeout=5) as response:
             page = response.read().decode()
         assert response.status == 200
-        assert "Saphira-A ONLINE" in page
+        assert "Saphira-A INITIALIZED" in page
         assert "Intelligence DISCONNECTED" in page
     finally:
         server.shutdown()
