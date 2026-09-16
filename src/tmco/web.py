@@ -427,6 +427,9 @@ class RuntimeWorker:
                 reply.put((False, safe_error))
 
     def submit(self, operation: str, *arguments: object, _exposed: bool = True) -> tuple[str, queue.Queue]:
+        emergency = getattr(getattr(self.app, "runtime", None), "emergency", None)
+        if emergency is not None and operation != "stop":
+            emergency.require_new_work_allowed()
         identity, reply = uuid4().hex, queue.Queue(maxsize=1)
         with self.lock: self.states[identity] = {"job_id": identity, "state": "QUEUED", "result": None,
                                                 "exposed": _exposed}

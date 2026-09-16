@@ -24,6 +24,7 @@ from .data_policy import DataClass
 from .models import ExclusionMode, ModelRecord, ModelRouter, ResponseMode
 from .morphogenesis import AssemblyFormationPolicy
 from .system import TMCOSystem
+from .paths import ProductPaths
 from .types import ActionCandidate, ComputeBudget, Goal, GoalStatus
 from .sisters import (BriefResponse, DigestResponse, SisterBrief, SisterDevelopmentDigest,
                       SisterExchangePolicy, SisterView, WorkClass, classify_work)
@@ -190,8 +191,8 @@ class GodRuntime:
     def __init__(self, directory: Path, providers: dict[str, ModelProvider] | None = None,
                  records: list[ModelRecord] | None = None, *, formation_policy: AssemblyFormationPolicy | None = None,
                  secret: bytes | str | None = None, web_test_allow_hosts: set[str] | None = None):
-        self.directory = directory
-        self.bus = ModelBus(production=True)
+        self.paths = ProductPaths.resolve(directory)
+        self.directory = self.paths.data_root
         self.router = ModelRouter()
         self.records: dict[str, ModelRecord] = {}
         self.routing_policy = "ZERO_COST"
@@ -201,21 +202,23 @@ class GodRuntime:
         # capability resolution and development do not depend on it.
         self.policy = formation_policy
         # Existing Phase 1 state format remains the authority for organism identity/neural state.
-        self.organism = TMCOSystem(directory / "organism", self.cognition, secret=secret,
+        self.organism = TMCOSystem(self.paths.organism_root, self.cognition, owner="Pier", secret=secret,
                                    formation_policy=self.policy)
-        self.store = AwakeningStore(directory / "awakening.sqlite3")
+        self.emergency = self.organism.emergency
+        self.bus = ModelBus(production=True, emergency=self.emergency)
+        self.store = AwakeningStore(self.paths.awakening_db)
         self.routing_policy = self.store.setting("routing_policy", "ZERO_COST")
         if self.routing_policy == "AUTO":
             self.routing_policy = "ZERO_COST"
             self.store.set_setting("routing_policy", self.routing_policy)
-        self.body_bus = BodyBus()
-        self.embodiment_store = EmbodimentStore(directory / "embodiment.sqlite3")
+        self.body_bus = BodyBus(self.emergency)
+        self.embodiment_store = EmbodimentStore(self.paths.embodiment_db)
         self.organ_registry = OrganRegistry(self.body_bus, self.embodiment_store)
         self.capability_resolver = CapabilityResolver(self.body_bus, self.embodiment_store)
         self.action_loop = ActionLoop(self.body_bus, self.embodiment_store, self._action_event)
         self.permission_authority = PermissionAuthority(self.embodiment_store)
-        self.owner_capabilities = OwnerCapabilityAuthority(self.organism.root,
-                                                           directory / "owner_capabilities.sqlite3")
+        self.owner_capabilities = OwnerCapabilityAuthority(self.organism.root, self.paths.owner_capabilities_db,
+                                                           emergency=self.emergency)
         self.bus.outbound_policy.authority = self.owner_capabilities
         self.sister_exchange = SisterExchangePolicy()
         self._restore_exchange_rounds()
@@ -290,6 +293,7 @@ class GodRuntime:
         return compact
 
     def _develop_gap(self, demand: CapabilityDemand, interpretations: dict[str, dict[str, Any]]) -> DevelopmentCandidate | None:
+        self.emergency.require_development_allowed()
         if (demand.network_need != "none" or demand.filesystem_need not in {"workspace", "none"}
                 or not interpretations):
             return None
@@ -432,6 +436,7 @@ class GodRuntime:
 
     def _model_call(self, record: ModelRecord, goal_id: str | None, episode_id: str | None,
                     task: str, colony: str | None, demand: str, context: dict[str, Any]) -> dict[str, Any]:
+        self.emergency.require_new_work_allowed()
         attempted: set[str] = set()
         current = record
         last_error: Exception | None = None
@@ -490,6 +495,7 @@ class GodRuntime:
         self.store.sister_state(colony, goal_id, status, summary, confidence)
 
     def submit_goal(self, text: str, *, important: bool = True) -> dict[str, Any]:
+        self.emergency.require_new_work_allowed()
         if not text.strip():
             raise ValueError("a natural-language goal is required")
         if not self.intelligence_connected:
@@ -610,6 +616,7 @@ class GodRuntime:
 
     def launch_goal(self, text: str) -> str:
         """Production entry point returning the durable identity of a launched goal."""
+        self.emergency.require_new_work_allowed()
         return str(self.submit_goal(text, important=True)["goal_id"])
 
     @staticmethod
@@ -751,6 +758,7 @@ class GodRuntime:
 
     def advance_goal(self, goal_id: str) -> dict[str, Any]:
         """Advance one bounded, durable goal step without replaying verified actions."""
+        self.emergency.require_new_work_allowed()
         rows = self.store.rows("SELECT state FROM goals WHERE id=?", (goal_id,))
         if not rows: raise KeyError("unknown goal")
         state = json.loads(rows[0]["state"])
@@ -872,6 +880,7 @@ class GodRuntime:
         return state
 
     def run_goal(self, goal_id: str, max_steps: int = 1) -> dict[str, Any]:
+        self.emergency.require_new_work_allowed()
         if not 1 <= max_steps <= 50: raise ValueError("max_steps must be between 1 and 50")
         state: dict[str, Any] = {}
         for _ in range(max_steps):
@@ -1172,6 +1181,8 @@ class GodRuntime:
                 "organ": goal.get("current_organ"), "latency_ms": selected["latency_ms"] if selected else None}
 
     def operational_status(self) -> dict[str, Any]:
+        try: emergency_state = self.emergency.state.name
+        except Exception: emergency_state = "LOCKDOWN_INVALID_STATE"
         active = self.store.rows("SELECT state FROM goals ORDER BY rowid DESC LIMIT 1")
         goal = json.loads(active[0]["state"]) if active else {}
         episode = {}
@@ -1190,7 +1201,9 @@ class GodRuntime:
         selected_record = self.records.get(selected_key) if selected_key else None
         resource_class = (selected_record.cost_classification if selected_record else
                           "NO FREE SAFE INTELLIGENCE AVAILABLE")
-        return {"current_goal": goal.get("description"), "work_class": goal.get("work_class"),
+        return {"emergency_state": emergency_state,
+                "product_state": "STOPPED" if emergency_state == "STOP_REQUESTED" else emergency_state,
+                "current_goal": goal.get("description"), "work_class": goal.get("work_class"),
                 "current_step": goal.get("current_step","idle"), "current_organ": goal.get("current_organ"),
                 "selected_colony": goal.get("selected_colony") or (selected.get("colony") if selected else None),
                 "selected_model": selected_key, "intelligence_resource": resource_class,
@@ -1243,6 +1256,7 @@ class GodRuntime:
                         {"goal_id": state["id"], "action_id": result.action_id})
 
     def chat(self, message: str) -> str:
+        self.emergency.require_new_work_allowed()
         self.store.chat("user", message)
         lower = message.lower().strip()
         active = self.store.rows("SELECT state FROM goals WHERE status='active' ORDER BY rowid DESC LIMIT 1")
